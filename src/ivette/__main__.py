@@ -1104,13 +1104,32 @@ def run_gaussian_pipeline(
     operation
 ):
 
-    workdir = (
-        Path("gaussian_runs")
-        /
-        str(model_id)
-        /
-        sdf_dir.name
+    # Store Gaussian calculations inside the SDF dataset
+    gaussian_root = (
+        sdf_dir /
+        "gaussian"
     )
+
+    if operation == "opt freq":
+
+        workdir = (
+            gaussian_root /
+            "opt_freq"
+        )
+
+    elif operation == "sp":
+
+        workdir = (
+            gaussian_root /
+            "single_point"
+        )
+
+    else:
+
+        workdir = (
+            gaussian_root /
+            str(operation).replace(" ", "_")
+        )
 
 
     workdir.mkdir(
@@ -1122,6 +1141,10 @@ def run_gaussian_pipeline(
     print("\nStarting Gaussian pipeline...")
     print(
         f"SDF directory: {sdf_dir}"
+    )
+
+    print(
+        f"Gaussian output: {workdir}"
     )
 
 
