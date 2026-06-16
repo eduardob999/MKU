@@ -1,0 +1,16 @@
+requests>=2.28
+tqdm>=4.0
+
+# Chemistry
+rdkit>=2024.3
+
+# Data handling
+numpy>=1.26
+pandas>=2.2
+
+# Machine learning
+scikit-learn>=1.5
+xgboost>=2.1
+
+# Model persistence
+joblib>=1.4

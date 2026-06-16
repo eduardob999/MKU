@@ -1,0 +1,60 @@
+
+# Run started 2026-06-16T10:15:26
+label                                                            seconds
+--------------------------------------------------------------------------
+CID=145813  PubChem details                                        2.520
+CID=145813  NIST lookup                                            1.190
+CID=145813  PubMed analysis                                        0.285
+CID=145813  PubChem property rows                                  0.772
+CID=145813  NIST section parsing                                   0.007
+CID=96706  PubChem details                                         2.006
+CID=96706  NIST lookup                                             1.158
+CID=96706  PubMed analysis                                         0.625
+CID=96706  PubChem property rows                                   0.296
+CID=96706  NIST section parsing                                    1.215
+CID=11865  PubChem details                                         1.681
+CID=11865  NIST lookup                                             1.209
+CID=11865  PubMed analysis                                         0.621
+CID=11865  PubChem property rows                                   0.807
+CID=11865  NIST section parsing                                    0.003
+CID=11866  PubChem details                                         2.105
+CID=11866  NIST lookup                                             1.148
+CID=11866  PubMed analysis                                         1.315
+CID=11866  PubChem property rows                                   0.812
+CID=11866  NIST section parsing                                    0.004
+CID=69974  PubChem details                                         2.467
+CID=69974  NIST lookup                                             1.177
+CID=69974  PubMed analysis                                         1.218
+CID=69974  PubChem property rows                                   0.829
+CID=69974  NIST section parsing                                    0.004
+Writing report CSVs                                                0.002
+Writing parsed properties CSV                                      0.002
+CID=145813  pharma PubChem CID=145813                              0.664
+CID=145813  pharma ChEMBL InChIKey=LOJNBPNACKZWAI-UHFFFAOYSA-N       2.741
+CID=145813  pharma BindingDB InChIKey=LOJNBPNACKZWAI-UHFFFAOYSA-N       1.519
+CID=145813  pharma total                                           4.925
+CID=96706  pharma PubChem CID=96706                                0.322
+CID=96706  pharma ChEMBL InChIKey=FTBBGQKRYUTLMP-UHFFFAOYSA-N       2.469
+CID=96706  pharma BindingDB InChIKey=FTBBGQKRYUTLMP-UHFFFAOYSA-N       1.267
+CID=96706  pharma total                                            4.060
+CID=11865  pharma PubChem CID=11865                                0.302
+CID=11865  pharma ChEMBL InChIKey=FUBFWTUFPGFHOJ-UHFFFAOYSA-N       1.225
+CID=11865  pharma BindingDB InChIKey=FUBFWTUFPGFHOJ-UHFFFAOYSA-N       1.278
+CID=11865  pharma total                                            2.807
+CID=11866  pharma PubChem CID=11866                                0.690
+CID=11866  pharma ChEMBL InChIKey=JIZRGGUCOQKGQD-UHFFFAOYSA-N       1.206
+CID=11866  pharma BindingDB InChIKey=JIZRGGUCOQKGQD-UHFFFAOYSA-N       1.309
+CID=11866  pharma total                                            3.208
+CID=69974  pharma PubChem CID=69974                                0.343
+CID=69974  pharma ChEMBL InChIKey=SIPCFXFCVTUAID-UHFFFAOYSA-N       1.210
+CID=69974  pharma BindingDB InChIKey=SIPCFXFCVTUAID-UHFFFAOYSA-N       1.288
+CID=69974  pharma total                                            2.843
+Writing pharmacology CSV                                           0.001
+Writing merged pharmacology CSV                                    0.001
+Cleaning pipeline (clean_thermo.py)                                0.590
+Merging pharmacology into wide output                              0.000
+Writing values-only wide CSV                                       0.000
+--------------------------------------------------------------------------
+TOTAL                                                             42.885
+COMPOUNDS PROCESSED                                                    5
+COMPOUNDS/SEC                                                      0.117
