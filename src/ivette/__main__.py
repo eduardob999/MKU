@@ -71,6 +71,7 @@ from ivette.core.train_pipeline import main as train_pipeline_main
 from ivette.core.download_training_sdfs import (
     main as download_training_sdfs_main
 )
+from ivette.module.gaussian16_pipeline import batch_run
 
 
 # ============================================================
@@ -1070,6 +1071,82 @@ def browse_compounds(df):
     )
 
 
+def find_model_sdf_sets(model_id):
+
+    results = []
+
+    metadata = load_sdf_metadata()
+
+    for sdf_id, info in metadata["sets"].items():
+
+        if info.get("model_id") != model_id:
+            continue
+
+        results.append(
+            Path(info["output_dir"])
+        )
+
+    return sorted(results)
+
+
+def count_sdfs(folder):
+
+    return len(
+        list(
+            folder.glob("*.sdf")
+        )
+    )
+
+
+def run_gaussian_pipeline(
+    model_id,
+    sdf_dir,
+    operation
+):
+
+    workdir = (
+        Path("gaussian_runs")
+        /
+        str(model_id)
+        /
+        sdf_dir.name
+    )
+
+
+    workdir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+
+    print("\nStarting Gaussian pipeline...")
+    print(
+        f"SDF directory: {sdf_dir}"
+    )
+
+
+    results = batch_run(
+        sdf_dir=str(sdf_dir),
+        work_dir=str(workdir),
+        jobs=1,
+        operation=operation,
+    )
+
+
+    success = sum(
+        r.success
+        for r in results
+    )
+
+    failed = len(results) - success
+
+
+    print(
+        f"\nGaussian finished:"
+        f" {success} succeeded,"
+        f" {failed} failed."
+    )
+
 
 # ============================================================
 # Menus
@@ -1821,87 +1898,46 @@ def model_menu(model_id):
             )
 
 
-def individual_model_menu(
-    model_id,
-    row
-):
-
-    target = row["target"]
+def individual_model_menu(model_id, row):
 
     while True:
 
-        show_model(model_id)
+        sdf_sets = find_model_sdf_sets(model_id)
+
+        print("\nSelected model:")
+        print(f"Target: {row['target']}")
+        print(f"Samples: {row['n_samples']}")
+        print(f"CV R²: {row['cv_r2_mean']:.4f}")
 
 
-        print()
+        print("\nSDF Sets:")
 
-        print(
-            "Selected model:"
-        )
+        for i, sdf_set in enumerate(sdf_sets, 1):
 
-
-        print(
-            f"Target: {target}"
-        )
-
-
-        print(
-            f"Samples: {row['n_samples']}"
-        )
-
-
-        print(
-            f"CV R²: {row['cv_r2_mean']:.4f}"
-        )
-
-
-        print()
-
-
-        sdf_sets = sdf_sets_for_model(
-            model_id,
-            target
-        )
-
-
-        print(
-            "SDF Sets:"
-        )
+            print(
+                f"  {i}. "
+                f"{sdf_set.name} "
+                f"({count_sdfs(sdf_set)} compounds)"
+            )
 
 
         if not sdf_sets:
+            print("  None generated.")
 
-            print(
-                "  None generated."
-            )
 
-        else:
+        print("\nActions:")
 
-            for sdf_id, sdf_info in sdf_sets:
-
-                print(
-                    f"  {sdf_id}: {sdf_info['name']}"
-                )
-
-                print(
-                    f"    Compounds: "
-                    f"{sdf_info['compound_count']}"
-                )
-
+        generate_option = len(sdf_sets) + 1
 
         print(
-            """
-Actions:
-
-1. Show feature importance
-2. Generate SDF set
-0. Back
-"""
+            f"{generate_option}. Generate new SDF set"
         )
+
+        print("0. Back")
 
 
         choice = input(
-            "\nSelect option: "
+            "\nSelect SDF set or action: "
         ).strip()
 
 
@@ -1910,30 +1946,47 @@ Actions:
             break
 
 
-        elif choice == "1":
+        try:
 
-            show_model_importance(
+            choice_int = int(choice)
+
+        except ValueError:
+
+            continue
+
+
+        # Existing SDF selection
+        if 1 <= choice_int <= len(sdf_sets):
+
+            selected_sdf = sdf_sets[
+                choice_int - 1
+            ]
+
+            sdf_set_menu(
                 model_id,
-                target
+                row,
+                selected_sdf
             )
 
-            input(
-                "\nPress Enter..."
-            )
+            continue
 
 
-        elif choice == "2":
+        # Generate new SDF
+        elif choice_int == generate_option:
 
             generate_sdf_menu(
                 model_id,
-                target
+                row["target"]
             )
 
+            continue
 
-def generate_sdf_menu(
+
+def generate_sdf_set(
     model_id,
-    target
+    row
 ):
+    target = row["target"]
 
     model_metadata = load_model_metadata()
 
@@ -2085,6 +2138,57 @@ def generate_sdf_menu(
     input(
         "\nPress Enter..."
     )
+
+
+def sdf_set_menu(model_id, row, sdf_dir):
+
+    while True:
+
+        print("\nSelected SDF set:")
+        print(
+            f"{sdf_dir.name}"
+        )
+
+        print(
+            f"Compounds: {count_sdfs(sdf_dir)}"
+        )
+
+
+        print("""
+Actions:
+
+1. Run Gaussian optimization + frequency
+2. Run Gaussian single point
+0. Back
+""")
+
+
+        choice = input(
+            "\nSelect: "
+        ).strip()
+
+
+        if choice == "0":
+
+            break
+
+
+        elif choice == "1":
+
+            run_gaussian_pipeline(
+                model_id,
+                sdf_dir,
+                operation="opt freq"
+            )
+
+
+        elif choice == "2":
+
+            run_gaussian_pipeline(
+                model_id,
+                sdf_dir,
+                operation="sp"
+            )
 
 
 # ============================================================
