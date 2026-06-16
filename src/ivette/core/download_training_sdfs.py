@@ -67,49 +67,153 @@ def download_sdf(cid: str, out_dir: Path, use_3d: bool = True) -> bool:
         return False
 
 
-def main() -> None:
+def main(argv=None):
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, help="merged_dataset.csv")
-    parser.add_argument("--output-dir", default="sdfs", help="Directory for SDF files")
-    parser.add_argument("--delay", type=float, default=0.25,
-                        help="Seconds between requests (default 0.25 — PubChem rate limit)")
-    parser.add_argument("--2d-only", dest="two_d", action="store_true",
-                        help="Download 2D SDFs only (skips 3D lookup)")
-    args = parser.parse_args()
 
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    parser.add_argument(
+        "--input",
+        required=True,
+        help="merged_dataset.csv"
+    )
 
-    print(f"Loading {args.input} …")
-    df = pd.read_csv(args.input, low_memory=False)
+    parser.add_argument(
+        "--output-dir",
+        default="sdfs",
+        help="Directory for SDF files"
+    )
 
-    targets = select_targets(df)
-    print(f"Qualifying targets : {len(targets)}")
-    for t in targets:
-        cov = df[t].notna().mean()
-        n   = df[t].dropna().shape[0]
-        print(f"  {t[:80]:<80}  coverage={cov:.2%}  n={n}")
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=0.25,
+        help="Seconds between requests"
+    )
 
-    cids = qualifying_cids(df, targets)
-    print(f"\nUnique CIDs to download: {len(cids)}")
+    parser.add_argument(
+        "--2d-only",
+        dest="two_d",
+        action="store_true",
+        help="Download 2D SDFs only"
+    )
 
-    ok = fail = skip = 0
-    for i, cid in enumerate(sorted(cids, key=lambda x: int(x) if x.isdigit() else 0), 1):
-        sdf_path = out_dir / f"{cid}.sdf"
+
+    args = parser.parse_args(
+        argv
+    )
+
+
+    out_dir = Path(
+        args.output_dir
+    )
+
+    out_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+
+    print(
+        f"Loading {args.input} ..."
+    )
+
+
+    df = pd.read_csv(
+        args.input,
+        low_memory=False
+    )
+
+
+    targets = select_targets(
+        df
+    )
+
+
+    print(
+        f"Qualifying targets : {len(targets)}"
+    )
+
+
+    cids = qualifying_cids(
+        df,
+        targets
+    )
+
+
+    print(
+        f"\nUnique CIDs to download: {len(cids)}"
+    )
+
+
+    ok = 0
+    fail = 0
+    skip = 0
+
+
+    for i, cid in enumerate(
+        sorted(
+            cids,
+            key=lambda x: int(x)
+            if x.isdigit()
+            else 0
+        ),
+        1
+    ):
+
+        sdf_path = (
+            out_dir /
+            f"{cid}.sdf"
+        )
+
+
         if sdf_path.exists():
-            skip += 1
-            continue
-        success = download_sdf(cid, out_dir, use_3d=not args.two_d)
-        if success:
-            ok += 1
-        else:
-            fail += 1
-        if i % 50 == 0:
-            print(f"  [{i}/{len(cids)}] ok={ok} fail={fail} skip={skip}")
-        time.sleep(args.delay)
 
-    print(f"\nDone. Downloaded={ok}  Failed={fail}  Already present={skip}")
-    print(f"SDF files written to: {out_dir.resolve()}")
+            skip += 1
+
+            continue
+
+
+        success = download_sdf(
+            cid,
+            out_dir,
+            use_3d=not args.two_d
+        )
+
+
+        if success:
+
+            ok += 1
+
+        else:
+
+            fail += 1
+
+
+        if i % 50 == 0:
+
+            print(
+                f"[{i}/{len(cids)}] "
+                f"ok={ok} fail={fail} skip={skip}"
+            )
+
+
+        time.sleep(
+            args.delay
+        )
+
+
+    print()
+
+    print(
+        f"Done. "
+        f"Downloaded={ok} "
+        f"Failed={fail} "
+        f"Already present={skip}"
+    )
+
+    print(
+        f"SDF files written to: {out_dir}"
+    )
 
 
 if __name__ == "__main__":

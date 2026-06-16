@@ -68,6 +68,9 @@ from ivette.core.download_physchem import (
 from ivette.core.find_thermo import main as find_thermo_main
 from ivette.core.train_xgboost_emfp import main as train_model_main
 from ivette.core.train_pipeline import main as train_pipeline_main
+from ivette.core.download_training_sdfs import (
+    main as download_training_sdfs_main
+)
 
 
 # ============================================================
@@ -208,6 +211,26 @@ MODEL_METADATA_FILE = (
 
 
 # ============================================================
+# Paths — SDF
+# ============================================================
+
+SDF_DIR = (
+    PROJECT_ROOT /
+    "data" /
+    "sdfs"
+)
+
+SDF_METADATA_FILE = (
+    SDF_DIR /
+    "metadata.json"
+)
+
+SDF_RUN_DIR = (
+    SDF_DIR /
+    "runs"
+)
+
+# ============================================================
 # Metadata — Structures
 # ============================================================
 
@@ -217,7 +240,6 @@ def ensure_storage():
         parents=True,
         exist_ok=True
     )
-
 
     if not METADATA_FILE.exists():
 
@@ -238,7 +260,6 @@ def ensure_storage():
         exist_ok=True
     )
 
-
     if not COMPOUND_METADATA_FILE.exists():
 
         with open(
@@ -258,7 +279,6 @@ def ensure_storage():
         exist_ok=True
     )
 
-
     if not THERMO_METADATA_FILE.exists():
 
         with open(
@@ -271,26 +291,25 @@ def ensure_storage():
                 f,
                 indent=4
             )
-    
-    MODEL_RUN_DIR.mkdir(
+
+
+    SDF_RUN_DIR.mkdir(
         parents=True,
         exist_ok=True
     )
 
-
-    if not MODEL_METADATA_FILE.exists():
+    if not SDF_METADATA_FILE.exists():
 
         with open(
-            MODEL_METADATA_FILE,
+            SDF_METADATA_FILE,
             "w"
         ) as f:
 
             json.dump(
-                {"models": {}},
+                {"sets": {}},
                 f,
                 indent=4
             )
-
 
 
 def load_metadata():
@@ -336,6 +355,113 @@ def next_set_id(metadata):
         f"set_{max(numbers)+1:06d}"
     )
 
+
+def load_sdf_metadata():
+
+    with open(
+        SDF_METADATA_FILE
+    ) as f:
+
+        return json.load(f)
+
+
+
+def save_sdf_metadata(metadata):
+
+    with open(
+        SDF_METADATA_FILE,
+        "w"
+    ) as f:
+
+        json.dump(
+            metadata,
+            f,
+            indent=4
+        )
+
+
+
+def next_sdf_id(metadata):
+
+    ids = metadata["sets"].keys()
+
+    if not ids:
+
+        return "sdf_000001"
+
+
+    numbers = [
+        int(x.split("_")[1])
+        for x in ids
+    ]
+
+    return (
+        f"sdf_{max(numbers)+1:06d}"
+    )
+
+
+
+def register_sdf_set(
+    model_id,
+    target,
+    name,
+    output_dir,
+    parameters,
+    count
+):
+
+    metadata = load_sdf_metadata()
+
+    sdf_id = next_sdf_id(metadata)
+
+    metadata["sets"][sdf_id] = {
+
+        "name": name,
+
+        "model_id": model_id,
+
+        "target": target,
+
+        "output_dir": str(output_dir),
+
+        "created":
+            datetime.now()
+            .isoformat(timespec="seconds"),
+
+        "parameters": parameters,
+
+        "compound_count": count
+    }
+
+
+    save_sdf_metadata(metadata)
+
+    return sdf_id
+
+
+def sdf_sets_for_model(
+    model_id,
+    target=None
+):
+
+    metadata = load_sdf_metadata()
+
+    results = []
+
+    for sdf_id, info in metadata["sets"].items():
+
+        if info.get("model_id") != model_id:
+            continue
+
+        if target is not None:
+            if info.get("target") != target:
+                continue
+
+        results.append(
+            (sdf_id, info)
+        )
+
+    return results
 
 
 # ============================================================
@@ -949,6 +1075,63 @@ def browse_compounds(df):
 # Menus
 # ============================================================
 
+
+def show_feature_importance(model_id):
+
+    metadata = load_model_metadata()
+
+    info = metadata["models"][model_id]
+
+
+    importance_file = info.get(
+        "importance_file"
+    )
+
+
+    if not importance_file:
+
+        print(
+            "No feature importance file registered."
+        )
+
+        return
+
+
+    path = Path(
+        importance_file
+    )
+
+
+    if not path.exists():
+
+        print(
+            f"Importance file not found:\n{path}"
+        )
+
+        return
+
+
+    df = pd.read_csv(
+        path
+    )
+
+
+    render_header()
+
+
+    print(
+        "Feature importance:\n"
+    )
+
+
+    print(
+        df.head(30)
+        .to_string(
+            index=False
+        )
+    )
+
+
 def generate_structure_menu():
 
     context.mode = (
@@ -1526,15 +1709,19 @@ def generate_model_menu(run_id):
 
 def model_menu(model_id):
 
-    df = load_model_report(
-        model_id
-    )
+    metadata = load_model_metadata()
+
+    info = metadata["models"][model_id]
 
 
-    if df.empty:
+    report = load_model_report(
+    model_id
+)
+
+    if report.empty:
 
         print(
-            "No models found."
+            "No trained models found."
         )
 
         input(
@@ -1544,90 +1731,58 @@ def model_menu(model_id):
         return
 
 
-    page_size = 15
+    PAGE_SIZE = 15
 
     page = 0
 
 
     while True:
 
+        start = page * PAGE_SIZE
+        end = start + PAGE_SIZE
 
-        total_pages = (
-            len(df) +
-            page_size -
+        page_df = report.iloc[start:end]
+
+
+        show_model(model_id)
+
+
+        print(
+            "\nModels:\n"
+        )
+
+
+        for i, (_, row) in enumerate(
+            page_df.iterrows(),
             1
-        ) // page_size
+        ):
 
+            print(
+                f"{i}. "
+                f"{row['target'][:70]}"
+            )
 
-        start = (
-            page *
-            page_size
-        )
+            print(
+                f"   n={row['n_samples']} "
+                f"CV R²={row['cv_r2_mean']:.4f}"
+            )
 
-        end = start + page_size
-
-
-        page_df = df.iloc[
-            start:end
-        ]
-
-
-        show_model(
-            model_id
-        )
 
 
         print()
 
-        print(
-            f"Models "
-            f"{start+1}-{min(end,len(df))} "
-            f"of {len(df)}"
-        )
+        if start > 0:
+            print("p. Previous page")
 
+        if end < len(report):
+            print("n. Next page")
 
-        print(
-            f"Page {page+1}/{total_pages}"
-        )
-
-
-        print()
-
-
-        for i, row in page_df.iterrows():
-
-            print(
-                f"{i-start+1:2}. "
-                f"R²={row['cv_r2_mean']:7.4f} | "
-                f"N={int(row['n_samples']):4} | "
-                f"{row['target'][:60]}"
-            )
-
-
-        print()
-
-        if page > 0:
-
-            print(
-                "p. Previous page"
-            )
-
-        if page < total_pages-1:
-
-            print(
-                "n. Next page"
-            )
-
-
-        print(
-            "0. Back"
-        )
+        print("0. Back")
 
 
         choice = input(
             "\nSelect model: "
-        ).strip().lower()
-
+        ).strip()
 
 
         if choice == "0":
@@ -1635,45 +1790,43 @@ def model_menu(model_id):
             break
 
 
-        elif choice == "n":
+        elif choice == "n" and end < len(report):
 
-            if page < total_pages-1:
-
-                page += 1
-
-
-        elif choice == "p":
-
-            if page > 0:
-
-                page -= 1
+            page += 1
+            continue
 
 
-        else:
+        elif choice == "p" and page > 0:
 
-            try:
-
-                idx = int(choice)-1
-
-            except ValueError:
-
-                continue
+            page -= 1
+            continue
 
 
-            if 0 <= idx < len(page_df):
+        try:
 
-                row = page_df.iloc[idx]
+            idx = int(choice)-1
 
-                individual_model_menu(
-                    model_id,
-                    row
-                )
+        except ValueError:
+
+            continue
+
+
+        if 0 <= idx < len(page_df):
+
+            row = page_df.iloc[idx]
+
+            individual_model_menu(
+                model_id,
+                row
+            )
 
 
 def individual_model_menu(
     model_id,
     row
 ):
+
+    target = row["target"]
 
     while True:
 
@@ -1688,7 +1841,7 @@ def individual_model_menu(
 
 
         print(
-            f"Target: {row['target']}"
+            f"Target: {target}"
         )
 
 
@@ -1702,11 +1855,46 @@ def individual_model_menu(
         )
 
 
+        print()
+
+
+        sdf_sets = sdf_sets_for_model(
+            model_id,
+            target
+        )
+
+
+        print(
+            "SDF Sets:"
+        )
+
+
+        if not sdf_sets:
+
+            print(
+                "  None generated."
+            )
+
+        else:
+
+            for sdf_id, sdf_info in sdf_sets:
+
+                print(
+                    f"  {sdf_id}: {sdf_info['name']}"
+                )
+
+                print(
+                    f"    Compounds: "
+                    f"{sdf_info['compound_count']}"
+                )
+
+
         print(
             """
 Actions:
 
 1. Show feature importance
+2. Generate SDF set
 0. Back
 """
         )
@@ -1726,12 +1914,177 @@ Actions:
 
             show_model_importance(
                 model_id,
-                row["target"]
+                target
             )
 
             input(
                 "\nPress Enter..."
             )
+
+
+        elif choice == "2":
+
+            generate_sdf_menu(
+                model_id,
+                target
+            )
+
+
+def generate_sdf_menu(
+    model_id,
+    target
+):
+
+    model_metadata = load_model_metadata()
+
+    model_info = (
+        model_metadata["models"][model_id]
+    )
+
+
+    context.mode = "Generating SDF Set"
+
+    context.info = {}
+
+    render_header()
+
+
+    name = input(
+        "SDF set name:\n> "
+    ).strip()
+
+
+    if not name:
+
+        return
+
+
+    dataset = Path(
+        model_info["parameters"]
+        ["source_dataset"]
+    )
+
+
+    if not dataset.exists():
+
+        print(
+            f"Dataset missing:\n{dataset}"
+        )
+
+        input("\nPress Enter...")
+
+        return
+
+
+
+    df = pd.read_csv(
+        dataset,
+        low_memory=False
+    )
+
+
+    if target not in df.columns:
+
+        print(
+            "Target missing:"
+        )
+
+        print(target)
+
+        input("\nPress Enter...")
+
+        return
+
+
+
+    df_target = (
+        df[
+            [
+                "CID",
+                target
+            ]
+        ]
+        .dropna(subset=[target])
+    )
+
+
+    sdf_id = next_sdf_id(
+        load_sdf_metadata()
+    )
+
+
+    output_dir = (
+        SDF_RUN_DIR /
+        sdf_id
+    )
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+
+    temp_csv = (
+        output_dir /
+        "training.csv"
+    )
+
+
+    df_target.to_csv(
+        temp_csv,
+        index=False
+    )
+
+
+    print(
+        "\nDownloading SDF files..."
+    )
+
+
+    download_training_sdfs_main(
+        [
+            "--input",
+            str(temp_csv),
+
+            "--output-dir",
+            str(output_dir)
+        ]
+    )
+
+
+    count = len(
+        list(
+            output_dir.glob("*.sdf")
+        )
+    )
+
+
+    register_sdf_set(
+        model_id,
+        target,
+        name,
+        output_dir,
+        {
+            "target": target,
+            "dataset": str(dataset),
+            "rows": len(df_target)
+        },
+        count
+    )
+
+
+    print(
+        "\nSDF set created."
+    )
+
+    print(
+        f"Compounds: {count}"
+    )
+
+
+    input(
+        "\nPress Enter..."
+    )
 
 
 # ============================================================
