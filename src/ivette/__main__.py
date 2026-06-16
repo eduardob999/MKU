@@ -66,6 +66,8 @@ from ivette.core.download_physchem import (
     DEFAULT_PROPERTIES,
 )
 from ivette.core.find_thermo import main as find_thermo_main
+from ivette.core.train_xgboost_emfp import main as train_model_main
+from ivette.core.train_pipeline import main as train_pipeline_main
 
 
 # ============================================================
@@ -188,6 +190,21 @@ THERMO_METADATA_FILE = (
     "metadata.json"
 )
 
+MODEL_DIR = (
+    PROJECT_ROOT /
+    "data" /
+    "models"
+)
+
+MODEL_RUN_DIR = (
+    MODEL_DIR /
+    "runs"
+)
+
+MODEL_METADATA_FILE = (
+    MODEL_DIR /
+    "metadata.json"
+)
 
 
 # ============================================================
@@ -251,6 +268,25 @@ def ensure_storage():
 
             json.dump(
                 {"runs": {}},
+                f,
+                indent=4
+            )
+    
+    MODEL_RUN_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+
+    if not MODEL_METADATA_FILE.exists():
+
+        with open(
+            MODEL_METADATA_FILE,
+            "w"
+        ) as f:
+
+            json.dump(
+                {"models": {}},
                 f,
                 indent=4
             )
@@ -349,6 +385,292 @@ def next_cset_id(metadata):
         f"cset_{max(numbers)+1:06d}"
     )
 
+
+# ============================================================
+# Metadata — Models
+# ============================================================
+
+def load_model_metadata():
+
+    with open(
+        MODEL_METADATA_FILE
+    ) as f:
+
+        return json.load(f)
+
+
+
+def save_model_metadata(metadata):
+
+    with open(
+        MODEL_METADATA_FILE,
+        "w"
+    ) as f:
+
+        json.dump(
+            metadata,
+            f,
+            indent=4
+        )
+
+
+
+def next_model_id(metadata):
+
+    ids = metadata["models"].keys()
+
+    if not ids:
+
+        return "model_000001"
+
+
+    numbers = [
+        int(x.split("_")[1])
+        for x in ids
+    ]
+
+    return (
+        f"model_{max(numbers)+1:06d}"
+    )
+
+
+
+def register_model(
+    thermo_run_id,
+    name,
+    parameters,
+    output_dir
+):
+
+    metadata = load_model_metadata()
+
+    model_id = next_model_id(
+        metadata
+    )
+
+
+    metadata["models"][model_id] = {
+
+        "name": name,
+
+        "thermo_run_id":
+            thermo_run_id,
+
+        "created":
+            datetime.now()
+            .isoformat(timespec="seconds"),
+
+        "parameters":
+            parameters,
+
+        "output_dir":
+            str(output_dir)
+
+    }
+
+
+    save_model_metadata(
+        metadata
+    )
+
+
+    return model_id
+
+
+
+def models_for_run(run_id):
+
+    metadata = load_model_metadata()
+
+    return [
+        (model_id, info)
+        for model_id, info
+        in metadata["models"].items()
+        if info.get("thermo_run_id") == run_id
+    ]
+
+
+def show_model(model_id):
+
+    metadata = load_model_metadata()
+
+    info = metadata["models"][model_id]
+
+
+    context.mode = "Model"
+
+    context.info = {
+
+        "Status":
+            "Available",
+
+        "Created":
+            info["created"].replace("T", " "),
+
+        "Thermo Run":
+            info["thermo_run_id"],
+
+    }
+
+
+    context.active_run = None
+
+    render_header()
+
+
+    print(
+        f"Model: {info['name']}"
+    )
+
+
+    print()
+
+    print(
+        "Parameters:"
+    )
+
+    for key, value in info["parameters"].items():
+
+        print(
+            f"  {key}: {value}"
+        )
+
+
+    return info
+
+
+def browse_model_outputs(model_id):
+
+    metadata = load_model_metadata()
+
+    info = metadata["models"][model_id]
+
+    output_dir = Path(
+        info["output_dir"]
+    )
+
+
+    show_model(model_id)
+
+
+    print(
+        "\nOutput files:\n"
+    )
+
+
+    files = sorted(
+        output_dir.iterdir()
+    )
+
+
+    if not files:
+
+        print(
+            "  (none)"
+        )
+
+        return
+
+
+    for f in files:
+
+        size = (
+            f.stat().st_size /
+            1024
+        )
+
+        print(
+            f"  {f.name:<40}"
+            f"{size:>8.1f} KB"
+        )
+
+
+def load_model_report(model_id):
+
+    metadata = load_model_metadata()
+
+    info = metadata["models"][model_id]
+
+    output_dir = Path(
+        info["output_dir"]
+    )
+
+    report = (
+        output_dir /
+        "model_report.csv"
+    )
+
+    if not report.exists():
+
+        return pd.DataFrame()
+
+
+    df = pd.read_csv(
+        report
+    )
+
+    if "cv_r2_mean" in df.columns:
+
+        df = df.sort_values(
+            "cv_r2_mean",
+            ascending=False
+        )
+
+
+    return df.reset_index(drop=True)
+
+
+def show_model_importance(
+    model_id,
+    target
+):
+
+    metadata = load_model_metadata()
+
+    info = metadata["models"][model_id]
+
+    output_dir = Path(
+        info["output_dir"]
+    )
+
+
+    safe_name = (
+        str(target)
+        .replace("/", "_")
+        .replace(":", "_")
+        .replace("[", "")
+        .replace("]", "")
+        .replace(" ", "_")
+    )
+
+
+    importance_file = (
+        output_dir /
+        f"{safe_name}_importance.csv"
+    )
+
+
+    render_header()
+
+
+    if not importance_file.exists():
+
+        print(
+            "Importance file not found."
+        )
+
+        return
+
+
+    df = pd.read_csv(
+        importance_file
+    )
+
+
+    print(
+        df.head(30)
+        .to_string(index=False)
+    )
 
 
 # ============================================================
@@ -1037,6 +1359,381 @@ def download_compounds_menu(set_id, df):
 
 
 
+def generate_model_menu(run_id):
+
+    info = load_run_info(
+        run_id
+    )
+
+
+    context.mode = "Training Model"
+
+    context.info = {}
+
+    render_header()
+
+
+    name = input(
+        "Model name:\n> "
+    ).strip()
+
+
+    if not name:
+
+        print(
+            "Cancelled."
+        )
+
+        return
+
+
+    metadata = load_model_metadata()
+
+    model_id = next_model_id(
+        metadata
+    )
+
+
+    output_dir = (
+        MODEL_RUN_DIR /
+        model_id
+    )
+
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+
+    thermo_dir = Path(
+        info["output_dir"]
+    )
+
+
+    # Prefer cleaned ML dataset
+    input_file = (
+        thermo_dir /
+        "wide_clean_values_only.csv"
+    )
+
+
+    if not input_file.exists():
+
+        input_file = (
+            thermo_dir /
+            "wide_values_only.csv"
+        )
+
+
+    if not input_file.exists():
+
+        print(
+            "No ML-ready thermo dataset found."
+        )
+
+        print(
+            "Expected:"
+        )
+
+        print(
+            "  wide_clean_values_only.csv"
+        )
+
+        print(
+            "or"
+        )
+
+        print(
+            "  wide_values_only.csv"
+        )
+
+        return
+
+
+    parameters = {
+
+        "radius": 2,
+
+        "nbits": 512,
+
+        "source_dataset":
+            str(input_file)
+
+    }
+
+
+    register_model(
+        run_id,
+        name,
+        parameters,
+        output_dir
+    )
+
+
+    render_header()
+
+
+    print(
+        "Starting model pipeline...\n"
+    )
+
+
+    argv = [
+
+        "--input",
+
+        str(input_file),
+
+        "--models-dir",
+
+        str(output_dir),
+
+        "--radius",
+
+        str(parameters["radius"]),
+
+        "--nbits",
+
+        str(parameters["nbits"])
+
+    ]
+
+
+    try:
+
+        train_pipeline_main(
+            argv
+        )
+
+
+        print(
+            "\nModel pipeline completed."
+        )
+
+
+    except Exception as exc:
+
+        print(
+            f"\nModel pipeline failed:\n{exc}"
+        )
+
+
+    input(
+        "\nPress Enter..."
+    )
+
+
+def model_menu(model_id):
+
+    df = load_model_report(
+        model_id
+    )
+
+
+    if df.empty:
+
+        print(
+            "No models found."
+        )
+
+        input(
+            "\nPress Enter..."
+        )
+
+        return
+
+
+    page_size = 15
+
+    page = 0
+
+
+    while True:
+
+
+        total_pages = (
+            len(df) +
+            page_size -
+            1
+        ) // page_size
+
+
+        start = (
+            page *
+            page_size
+        )
+
+        end = start + page_size
+
+
+        page_df = df.iloc[
+            start:end
+        ]
+
+
+        show_model(
+            model_id
+        )
+
+
+        print()
+
+        print(
+            f"Models "
+            f"{start+1}-{min(end,len(df))} "
+            f"of {len(df)}"
+        )
+
+
+        print(
+            f"Page {page+1}/{total_pages}"
+        )
+
+
+        print()
+
+
+        for i, row in page_df.iterrows():
+
+            print(
+                f"{i-start+1:2}. "
+                f"R²={row['cv_r2_mean']:7.4f} | "
+                f"N={int(row['n_samples']):4} | "
+                f"{row['target'][:60]}"
+            )
+
+
+        print()
+
+        if page > 0:
+
+            print(
+                "p. Previous page"
+            )
+
+        if page < total_pages-1:
+
+            print(
+                "n. Next page"
+            )
+
+
+        print(
+            "0. Back"
+        )
+
+
+        choice = input(
+            "\nSelect model: "
+        ).strip().lower()
+
+
+
+        if choice == "0":
+
+            break
+
+
+        elif choice == "n":
+
+            if page < total_pages-1:
+
+                page += 1
+
+
+        elif choice == "p":
+
+            if page > 0:
+
+                page -= 1
+
+
+        else:
+
+            try:
+
+                idx = int(choice)-1
+
+            except ValueError:
+
+                continue
+
+
+            if 0 <= idx < len(page_df):
+
+                row = page_df.iloc[idx]
+
+                individual_model_menu(
+                    model_id,
+                    row
+                )
+
+
+def individual_model_menu(
+    model_id,
+    row
+):
+
+    while True:
+
+        show_model(model_id)
+
+
+        print()
+
+        print(
+            "Selected model:"
+        )
+
+
+        print(
+            f"Target: {row['target']}"
+        )
+
+
+        print(
+            f"Samples: {row['n_samples']}"
+        )
+
+
+        print(
+            f"CV R²: {row['cv_r2_mean']:.4f}"
+        )
+
+
+        print(
+            """
+Actions:
+
+1. Show feature importance
+0. Back
+"""
+        )
+
+
+        choice = input(
+            "\nSelect option: "
+        ).strip()
+
+
+        if choice == "0":
+
+            break
+
+
+        elif choice == "1":
+
+            show_model_importance(
+                model_id,
+                row["target"]
+            )
+
+            input(
+                "\nPress Enter..."
+            )
+
+
 # ============================================================
 # Metadata — Thermo Runs
 # ============================================================
@@ -1570,19 +2267,54 @@ def run_menu(run_id):
 
         show_run(run_id)
 
-        print(
-            """
-Actions:
 
-1. Browse output files
-2. Preview a CSV
-0. Back
-"""
+        models = models_for_run(
+            run_id
         )
 
+
+        print(
+            "\nActions:\n"
+        )
+
+
+        print(
+            "1. Browse output files"
+        )
+
+        print(
+            "2. Preview a CSV"
+        )
+
+        print(
+            "3. Train new model"
+        )
+
+
+        if models:
+
+            print(
+                "\nModels:\n"
+            )
+
+            for i, (model_id, info) in enumerate(
+                models,
+                1
+            ):
+
+                print(
+                    f"{i+3}. {info['name']}"
+                )
+
+        print(
+            "\n0. Back"
+        )
+
+
         choice = input(
-            "Select option: "
+            "\nSelect option: "
         ).strip()
+
 
         if choice == "0":
 
@@ -1592,18 +2324,54 @@ Actions:
 
             break
 
-        elif choice == "1":
 
-            browse_run_outputs(run_id)
+        try:
 
-            input("\nPress Enter...")
+            choice = int(choice)
 
-        elif choice == "2":
+        except ValueError:
 
-            preview_run_output(run_id)
+            continue
 
-            input("\nPress Enter...")
 
+        if choice == 1:
+
+            browse_run_outputs(
+                run_id
+            )
+
+            input(
+                "\nPress Enter..."
+            )
+
+
+        elif choice == 2:
+
+            preview_run_output(
+                run_id
+            )
+
+            input(
+                "\nPress Enter..."
+            )
+
+
+        elif choice == 3:
+
+            generate_model_menu(
+                run_id
+            )
+
+
+        elif choice > 3 and choice <= len(models)+3:
+
+            model_id = models[
+                choice-4
+            ][0]
+
+            model_menu(
+                model_id
+            )
 
 
 def thermo_menu(cset_id):
