@@ -38,10 +38,76 @@ import re
 import subprocess
 import sys
 import tempfile
+import json
+import signal
+from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+def checkpoint_path(work_dir):
+    return Path(work_dir) / "checkpoint.json"
+
+
+
+def load_checkpoint(work_dir):
+
+    path = checkpoint_path(work_dir)
+
+    if not path.exists():
+        return {
+            "created": datetime.now().isoformat(),
+            "jobs": {}
+        }
+
+    with open(path) as f:
+        return json.load(f)
+
+
+
+def save_checkpoint(work_dir, checkpoint):
+
+    path = checkpoint_path(work_dir)
+
+    tmp = path.with_suffix(".tmp")
+
+    with open(tmp, "w") as f:
+        json.dump(
+            checkpoint,
+            f,
+            indent=4
+        )
+
+    tmp.replace(path)
+
+
+
+def update_checkpoint(
+    work_dir,
+    cid,
+    status,
+    extra=None
+):
+
+    checkpoint = load_checkpoint(work_dir)
+
+    checkpoint["jobs"].setdefault(cid, {})
+
+    checkpoint["jobs"][cid].update(
+        {
+            "status": status,
+            "updated": datetime.now().isoformat()
+        }
+    )
+
+    if extra:
+        checkpoint["jobs"][cid].update(extra)
+
+    save_checkpoint(
+        work_dir,
+        checkpoint
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -168,10 +234,10 @@ def build_gjf(
     basis_set:    str  = "6-31G*",
     charge:       int  = 0,
     multiplicity: int  = 1,
-    method:       str  = "B3LYP",
+    method:       str  = "PBE0",
     operation:    str  = "opt freq",   # e.g. "sp", "opt", "opt freq"
-    nproc:        int  = 4,
-    mem:          str  = "4GB",
+    nproc:        int  = 10,
+    mem:          str  = "8GB",
     title:        str  = "Gaussian 16 DFT Calculation",
     extra_keywords: str = "",          # e.g. "empiricaldispersion=gd3bj"
     cosmo:        bool = False,        # SCRF=(CPCM,Solvent=Water)
@@ -698,57 +764,198 @@ def run_compound(
 # ──────────────────────────────────────────────────────────────────────────────
 
 def batch_run(
-    sdf_dir:  str,
+    sdf_dir: str,
     work_dir: str,
-    jobs:     int  = 1,
-    **kwargs,             # forwarded to run_compound
-) -> list[RunResult]:
-    """
-    Run Gaussian on all SDF files in *sdf_dir*, optionally in parallel.
+    jobs: int = 1,
+    resume: bool = True,       # ← add this
+    checkpoint: str = None,    # ← add this (unused; work_dir-based path is used internally)
+    **kwargs,
+):
 
-    NOTE: Gaussian itself may already use all cores via %nprocshared.
-    Set jobs=1 (default) unless you have separate CPU allocations per job,
-    otherwise CPU over-subscription will slow things down.
-    """
-    sdfs = sorted(Path(sdf_dir).glob("*.sdf"))
+    sdfs = sorted(
+        Path(sdf_dir).glob("*.sdf")
+    )
+
     if not sdfs:
-        print(f"No SDF files found in {sdf_dir}")
+
+        print(
+            f"No SDF files found in {sdf_dir}"
+        )
+
         return []
 
-    print(f"Found {len(sdfs)} SDF files. Submitting with {jobs} worker(s).")
-    results: list[RunResult] = []
 
-    if jobs <= 1:
-        for i, sdf in enumerate(sdfs, 1):
-            print(f"[{i}/{len(sdfs)}] {sdf.name}", flush=True)
-            r = run_compound(str(sdf), work_dir, **kwargs)
-            _print_result(r)
-            results.append(r)
-    else:
-        with ProcessPoolExecutor(max_workers=jobs) as pool:
-            futures = {
-                pool.submit(run_compound, str(sdf), work_dir, **kwargs): sdf
-                for sdf in sdfs
-            }
-            for i, fut in enumerate(as_completed(futures), 1):
-                sdf = futures[fut]
-                try:
-                    r = fut.result()
-                except Exception as exc:
-                    r = RunResult(
-                        cid=sdf.stem, sdf_path=str(sdf),
-                        gjf_path="", log_path="",
-                        success=False, error_msg=str(exc),
-                    )
-                print(f"[{i}/{len(sdfs)}] {sdf.name}", flush=True)
-                _print_result(r)
-                results.append(r)
+    Path(work_dir).mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
-    # ── Summary ───────────────────────────────────────────────────────────────
-    ok   = sum(1 for r in results if r.success)
-    fail = len(results) - ok
-    print(f"\nBatch complete: {ok} succeeded, {fail} failed.")
-    _write_summary(results, Path(work_dir) / "batch_summary.tsv")
+
+    checkpoint = load_checkpoint(
+        work_dir
+    )
+
+
+    pending = []
+
+
+    for sdf in sdfs:
+
+        cid = sdf.stem
+
+        status = (
+            checkpoint["jobs"]
+            .get(cid, {})
+            .get("status")
+        )
+
+
+        if status == "completed":
+
+            print(
+                f"Skipping {cid} (already completed)"
+            )
+
+            continue
+
+
+        pending.append(sdf)
+
+
+
+    print(
+        f"""
+Gaussian checkpoint:
+
+Total molecules : {len(sdfs)}
+Already done    : {len(sdfs)-len(pending)}
+Remaining       : {len(pending)}
+"""
+    )
+
+
+    results = []
+
+
+    interrupted = False
+
+
+    try:
+
+        for i, sdf in enumerate(
+            pending,
+            1
+        ):
+
+            cid = sdf.stem
+
+
+            print(
+                f"[{i}/{len(pending)}] {cid}",
+                flush=True
+            )
+
+
+            update_checkpoint(
+                work_dir,
+                cid,
+                "running"
+            )
+
+
+            try:
+
+                result = run_compound(
+                    str(sdf),
+                    work_dir,
+                    **kwargs
+                )
+
+
+            except KeyboardInterrupt:
+
+                update_checkpoint(
+                    work_dir,
+                    cid,
+                    "interrupted"
+                )
+
+                raise
+
+
+            except Exception as exc:
+
+                result = RunResult(
+                    cid=cid,
+                    sdf_path=str(sdf),
+                    gjf_path="",
+                    log_path="",
+                    success=False,
+                    error_msg=str(exc),
+                )
+
+
+            results.append(result)
+
+
+            if result.success:
+
+                update_checkpoint(
+                    work_dir,
+                    cid,
+                    "completed",
+                    {
+                        "energy":
+                            result.energy
+                    }
+                )
+
+            else:
+
+                update_checkpoint(
+                    work_dir,
+                    cid,
+                    "failed",
+                    {
+                        "error":
+                            result.error_msg
+                    }
+                )
+
+
+            _print_result(
+                result
+            )
+
+
+    except KeyboardInterrupt:
+
+        print(
+            "\n\nGaussian interrupted."
+        )
+
+        print(
+            "Checkpoint saved."
+        )
+
+        print(
+            "Run the same command again to resume."
+        )
+
+        interrupted = True
+
+
+
+    finally:
+
+        _write_summary(
+            results,
+            Path(work_dir)
+            /
+            "batch_summary.tsv"
+        )
+
+
     return results
 
 

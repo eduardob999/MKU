@@ -1104,55 +1104,43 @@ def run_gaussian_pipeline(
     operation
 ):
 
-    # Store Gaussian calculations inside the SDF dataset
     gaussian_root = (
-        sdf_dir /
+        Path(sdf_dir)
+        /
         "gaussian"
+        /
+        operation.replace(" ", "_")
     )
 
-    if operation == "opt freq":
-
-        workdir = (
-            gaussian_root /
-            "opt_freq"
-        )
-
-    elif operation == "sp":
-
-        workdir = (
-            gaussian_root /
-            "single_point"
-        )
-
-    else:
-
-        workdir = (
-            gaussian_root /
-            str(operation).replace(" ", "_")
-        )
-
-
-    workdir.mkdir(
+    gaussian_root.mkdir(
         parents=True,
         exist_ok=True
     )
 
 
-    print("\nStarting Gaussian pipeline...")
+    checkpoint = (
+        gaussian_root /
+        "checkpoint.json"
+    )
+
+
+    print("\nGaussian pipeline")
     print(
         f"SDF directory: {sdf_dir}"
     )
 
     print(
-        f"Gaussian output: {workdir}"
+        f"Working directory: {gaussian_root}"
     )
 
 
     results = batch_run(
         sdf_dir=str(sdf_dir),
-        work_dir=str(workdir),
+        work_dir=str(gaussian_root),
         jobs=1,
         operation=operation,
+        resume=True,
+        checkpoint=str(checkpoint)
     )
 
 
@@ -1161,13 +1149,19 @@ def run_gaussian_pipeline(
         for r in results
     )
 
-    failed = len(results) - success
+    failed = len(results)-success
 
 
     print(
-        f"\nGaussian finished:"
-        f" {success} succeeded,"
-        f" {failed} failed."
+        "\nGaussian finished:"
+    )
+
+    print(
+        f"  Successful: {success}"
+    )
+
+    print(
+        f"  Failed: {failed}"
     )
 
 
