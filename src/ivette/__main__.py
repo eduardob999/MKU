@@ -54,6 +54,7 @@ from datetime import datetime
 import json
 import time
 import sys
+import shutil
 
 import pandas as pd
 
@@ -477,6 +478,42 @@ def load_compound_metadata():
 
         return json.load(f)
 
+
+def delete_sdf_set(sdf_id):
+    """
+    Permanently delete an SDF set (files + metadata entry).
+    """
+
+    metadata = load_sdf_metadata()
+
+    if sdf_id not in metadata["sets"]:
+        print("SDF set not found in metadata.")
+        return False
+
+    info = metadata["sets"][sdf_id]
+    output_dir = Path(info["output_dir"])
+
+    print("\n⚠️  WARNING: This will permanently delete:")
+    print(f"  ID   : {sdf_id}")
+    print(f"  Name : {info.get('name')}")
+    print(f"  Path : {output_dir}")
+
+    confirm = input("\nType 'DELETE' to confirm: ").strip()
+
+    if confirm != "DELETE":
+        print("Cancelled.")
+        return False
+
+    # 1. Delete files
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+
+    # 2. Remove metadata
+    del metadata["sets"][sdf_id]
+    save_sdf_metadata(metadata)
+
+    print("SDF set deleted.")
+    return True
 
 
 def save_compound_metadata(metadata):
@@ -1103,7 +1140,6 @@ def run_gaussian_pipeline(
     sdf_dir,
     operation
 ):
-
     gaussian_root = (
         Path(sdf_dir)
         /
@@ -1117,22 +1153,16 @@ def run_gaussian_pipeline(
         exist_ok=True
     )
 
-
     checkpoint = (
         gaussian_root /
         "checkpoint.json"
     )
 
-
     print("\nGaussian pipeline")
-    print(
-        f"SDF directory: {sdf_dir}"
-    )
+    print(f"SDF directory: {sdf_dir}")
+    print(f"Working directory: {gaussian_root}")
 
-    print(
-        f"Working directory: {gaussian_root}"
-    )
-
+    nproc = _ask("Number of CPU cores to use", 8, int)   # ← add this
 
     results = batch_run(
         sdf_dir=str(sdf_dir),
@@ -1140,7 +1170,8 @@ def run_gaussian_pipeline(
         jobs=1,
         operation=operation,
         resume=True,
-        checkpoint=str(checkpoint)
+        checkpoint=str(checkpoint),
+        nproc=nproc,                                       # ← and this
     )
 
 
@@ -1991,9 +2022,9 @@ def individual_model_menu(model_id, row):
         # Generate new SDF
         elif choice_int == generate_option:
 
-            generate_sdf_menu(
+            generate_sdf_set(
                 model_id,
-                row["target"]
+                row
             )
 
             continue
@@ -2162,50 +2193,56 @@ def sdf_set_menu(model_id, row, sdf_dir):
     while True:
 
         print("\nSelected SDF set:")
-        print(
-            f"{sdf_dir.name}"
-        )
-
-        print(
-            f"Compounds: {count_sdfs(sdf_dir)}"
-        )
-
+        print(f"{sdf_dir.name}")
+        print(f"Compounds: {count_sdfs(sdf_dir)}")
 
         print("""
 Actions:
 
 1. Run Gaussian optimization + frequency
 2. Run Gaussian single point
+3. Delete SDF set
 0. Back
 """)
 
-
-        choice = input(
-            "\nSelect: "
-        ).strip()
-
+        choice = input("\nSelect: ").strip()
 
         if choice == "0":
-
             break
 
-
         elif choice == "1":
-
             run_gaussian_pipeline(
                 model_id,
                 sdf_dir,
                 operation="opt freq"
             )
 
-
         elif choice == "2":
-
             run_gaussian_pipeline(
                 model_id,
                 sdf_dir,
                 operation="sp"
             )
+
+        elif choice == "3":
+
+            # find sdf_id from metadata by path match
+            metadata = load_sdf_metadata()
+
+            sdf_id = None
+            for k, v in metadata["sets"].items():
+                if Path(v["output_dir"]) == sdf_dir:
+                    sdf_id = k
+                    break
+
+            if sdf_id is None:
+                print("Could not resolve SDF ID.")
+                continue
+
+            deleted = delete_sdf_set(sdf_id)
+
+            if deleted:
+                break
 
 
 # ============================================================

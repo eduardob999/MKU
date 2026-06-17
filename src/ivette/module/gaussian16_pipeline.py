@@ -696,20 +696,16 @@ def run_compound(
     sdf_path:    str,
     work_dir:    str,
     g16_exec:    str   = "g16",
-    basis_set:   str   = "6-31G*",
-    method:      str   = "B3LYP",
+    basis_set:   str   = "6-311G*",
+    method:      str   = "PBE0",
     operation:   str   = "opt freq",
     charge:      int   = 0,
     multiplicity: int  = 1,
-    nproc:       int   = 4,
+    nproc:       Optional[int] = None,
     mem:         str   = "4GB",
     cosmo:       bool  = False,
     timeout:     Optional[int] = None,
 ) -> RunResult:
-    """
-    Full pipeline for one compound:
-      SDF → .gjf → g16 → parse .log → RunResult
-    """
     sdf_path = str(sdf_path)
     cid      = Path(sdf_path).stem
     work_dir = Path(work_dir) / cid
@@ -719,13 +715,14 @@ def run_compound(
     chk_path = str(work_dir / f"{cid}.chk")
     log_path = str(work_dir / f"{cid}.log")
 
-    # ── Build input ───────────────────────────────────────────────────────────
+    effective_nproc = nproc if nproc is not None else os.cpu_count() or 4
+
     try:
         sdf_to_gjf(
             sdf_path, gjf_path, chk_path,
             basis_set=basis_set, method=method, operation=operation,
             charge=charge, multiplicity=multiplicity,
-            nproc=nproc, mem=mem, cosmo=cosmo,
+            nproc=effective_nproc, mem=mem, cosmo=cosmo,
             title=f"CID {cid}",
         )
     except Exception as exc:
@@ -734,7 +731,6 @@ def run_compound(
             log_path=log_path, success=False, error_msg=f"GJF build failed: {exc}",
         )
 
-    # ── Run Gaussian ──────────────────────────────────────────────────────────
     ok, err = run_gaussian(gjf_path, log_path, g16_exec=g16_exec, timeout=timeout)
     if not ok or not check_normal_termination(log_path):
         return RunResult(
@@ -743,7 +739,6 @@ def run_compound(
             error_msg=err or "Abnormal termination",
         )
 
-    # ── Parse output ──────────────────────────────────────────────────────────
     energy    = get_final_scf_energy(log_path)
     thermo    = get_thermo_data(log_path) if "freq" in operation.lower() else None
     opt_steps = []
@@ -752,12 +747,11 @@ def run_compound(
         if step:
             opt_steps.append(step)
 
-    return RunResult(
+    return RunResult(                          # ← this was missing
         cid=cid, sdf_path=sdf_path, gjf_path=gjf_path,
         log_path=log_path, success=True,
         energy=energy, thermo=thermo, opt_steps=opt_steps,
     )
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Batch runner
@@ -871,7 +865,6 @@ Remaining       : {len(pending)}
                     **kwargs
                 )
 
-
             except KeyboardInterrupt:
 
                 update_checkpoint(
@@ -881,7 +874,6 @@ Remaining       : {len(pending)}
                 )
 
                 raise
-
 
             except Exception as exc:
 
@@ -894,9 +886,17 @@ Remaining       : {len(pending)}
                     error_msg=str(exc),
                 )
 
+            if result is None:                    # ← guard
+                result = RunResult(
+                    cid=cid,
+                    sdf_path=str(sdf),
+                    gjf_path="",
+                    log_path="",
+                    success=False,
+                    error_msg="run_compound returned None",
+                )
 
             results.append(result)
-
 
             if result.success:
 
@@ -976,6 +976,8 @@ def _write_summary(results: list[RunResult], path: Path) -> None:
         w = csv.DictWriter(fh, fieldnames=fields, delimiter="\t")
         w.writeheader()
         for r in results:
+            if r is None:               # ← guard
+                continue
             w.writerow({
                 "cid":        r.cid,
                 "success":    r.success,
@@ -1002,12 +1004,12 @@ def main(argv=None) -> int:
 
     parser.add_argument("--workdir",      default="./g16_runs",   help="Working / output directory")
     parser.add_argument("--g16",          default="g16",           help="Gaussian 16 executable name or path")
-    parser.add_argument("--basis",        default="6-31G*",        help="Basis set (default: 6-31G*)")
-    parser.add_argument("--method",       default="B3LYP",         help="DFT functional (default: B3LYP)")
+    parser.add_argument("--basis",        default="6-311G*",        help="Basis set (default: 6-311G*)")
+    parser.add_argument("--method",       default="PBE0",         help="DFT functional (default: PBE0)")
     parser.add_argument("--operation",    default="opt freq",      help="Gaussian task keywords (default: 'opt freq')")
     parser.add_argument("--charge",       default=0,  type=int,    help="Molecular charge (default: 0)")
     parser.add_argument("--mult",         default=1,  type=int,    help="Spin multiplicity (default: 1)")
-    parser.add_argument("--nproc",        default=4,  type=int,    help="%nprocshared (default: 4)")
+    parser.add_argument("--nproc",        default=10, type=int,     help="%nprocshared (default: 10)")
     parser.add_argument("--mem",          default="4GB",           help="%%mem (default: 4GB)")
     parser.add_argument("--cosmo",        action="store_true",     help="Enable SCRF=(CPCM,Solvent=Water)")
     parser.add_argument("--jobs",         default=1,  type=int,    help="Parallel workers for batch (default: 1)")
