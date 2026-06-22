@@ -3,18 +3,16 @@
 gaussian16_pipeline.py
 Local Gaussian 16 pipeline on Linux: SDF → .gjf input → run g16 → parse .log output.
 
-Equivalent to the NWChem pipeline but targeting Gaussian 16.
-
 Usage (single compound):
     python gaussian16_pipeline.py --sdf compound.sdf --workdir ./runs
 
 Usage (batch over a directory of SDFs):
     python gaussian16_pipeline.py --sdf-dir ./sdfs --workdir ./runs --jobs 4
 
-# Single compound, opt + freq at B3LYP/6-31G*
+# Single compound, opt + freq at PBE0/6-311G*
 python gaussian16_pipeline.py --sdf 10701.sdf --workdir ./runs
 
-# Whole SDF directory, single-point only, larger basis, with solvent
+# Whole SDF directory, with solvent, custom scratch dir
 python gaussian16_pipeline.py \
     --sdf-dir ./sdfs \
     --workdir ./runs \
@@ -23,7 +21,9 @@ python gaussian16_pipeline.py \
     --method "M062X" \
     --cosmo \
     --nproc 8 \
-    --mem 16GB
+    --mem 16GB \
+    --scratch /fast/scratch \
+    --max-disk 60GB
 
 # If g16 isn't on PATH
 python gaussian16_pipeline.py --sdf 10701.sdf --g16 /opt/gaussian/g16/g16
@@ -35,97 +35,156 @@ import argparse
 import dataclasses
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import json
-import signal
 from datetime import datetime
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Scratch management
+# ──────────────────────────────────────────────────────────────────────────────
+
+def get_scratch_dir(scratch_arg: Optional[str] = None) -> str:
+    """
+    Resolve the scratch directory to use, in priority order:
+      1. Explicit --scratch CLI argument
+      2. $GAUSS_SCRDIR environment variable
+      3. /tmp as fallback
+    """
+    if scratch_arg:
+        return scratch_arg
+    return os.environ.get("GAUSS_SCRDIR", "/tmp")
+
+
+def cleanup_scratch_for_cid(scratch_dir: str, cid: str) -> None:
+    """
+    Remove all Gaussian scratch files for a specific CID from scratch_dir.
+    Called both before a job starts (clear previous crash debris) and after
+    a failed/interrupted job.
+
+    File types cleaned:
+        .rwf  – read-write file (the main disk hog; can be 100s of GB)
+        .skr  – scratch integral file
+        .d2e  – second derivative file
+        .int  – integral file
+        .inp  – temporary input copy
+    """
+    scratch = Path(scratch_dir)
+    patterns = [
+        f"{cid}*.rwf",
+        f"{cid}*.rwf.bak",
+        f"{cid}*.skr",
+        f"{cid}*.d2e",
+        f"{cid}*.int",
+        f"{cid}*.inp",
+    ]
+    removed = []
+    for pattern in patterns:
+        for f in scratch.glob(pattern):
+            try:
+                f.unlink()
+                removed.append(f.name)
+            except OSError as e:
+                print(f"  [scratch] Warning: could not remove {f}: {e}")
+    if removed:
+        print(f"  [scratch] Removed {len(removed)} leftover file(s): "
+              f"{', '.join(removed[:8])}{'…' if len(removed) > 8 else ''}")
+
+
+def cleanup_all_scratch(scratch_dir: str) -> None:
+    """
+    Nuclear option: remove ALL Gaussian scratch intermediates from scratch_dir.
+    Does NOT touch .chk or .log files.
+    Safe to run before a fresh batch.
+    """
+    scratch = Path(scratch_dir)
+    if not scratch.exists():
+        return
+    patterns = ["*.rwf", "*.rwf.bak", "*.skr", "*.d2e", "*.int"]
+    total = 0
+    for pattern in patterns:
+        for f in scratch.glob(pattern):
+            try:
+                f.unlink()
+                total += 1
+            except OSError:
+                pass
+    if total:
+        print(f"[scratch] Cleaned {total} stale scratch file(s) from {scratch_dir}")
+
+
+def report_scratch_usage(scratch_dir: str) -> None:
+    """Print a quick summary of what's currently in scratch_dir."""
+    scratch = Path(scratch_dir)
+    if not scratch.exists():
+        return
+    files = list(scratch.iterdir())
+    if not files:
+        print(f"[scratch] {scratch_dir} is empty.")
+        return
+    total = sum(f.stat().st_size for f in files if f.is_file())
+    print(f"[scratch] {scratch_dir}: {len(files)} files, "
+          f"{total / 1024**3:.1f} GB total")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Checkpoint
+# ──────────────────────────────────────────────────────────────────────────────
 
 def checkpoint_path(work_dir):
     return Path(work_dir) / "checkpoint.json"
 
 
-
 def load_checkpoint(work_dir):
-
     path = checkpoint_path(work_dir)
-
     if not path.exists():
-        return {
-            "created": datetime.now().isoformat(),
-            "jobs": {}
-        }
-
+        return {"created": datetime.now().isoformat(), "jobs": {}}
     with open(path) as f:
         return json.load(f)
 
 
-
 def save_checkpoint(work_dir, checkpoint):
-
     path = checkpoint_path(work_dir)
-
     tmp = path.with_suffix(".tmp")
-
     with open(tmp, "w") as f:
-        json.dump(
-            checkpoint,
-            f,
-            indent=4
-        )
-
+        json.dump(checkpoint, f, indent=4)
     tmp.replace(path)
 
 
-
-def update_checkpoint(
-    work_dir,
-    cid,
-    status,
-    extra=None
-):
-
+def update_checkpoint(work_dir, cid, status, extra=None):
     checkpoint = load_checkpoint(work_dir)
-
     checkpoint["jobs"].setdefault(cid, {})
-
-    checkpoint["jobs"][cid].update(
-        {
-            "status": status,
-            "updated": datetime.now().isoformat()
-        }
-    )
-
+    checkpoint["jobs"][cid].update({
+        "status": status,
+        "updated": datetime.now().isoformat(),
+    })
     if extra:
         checkpoint["jobs"][cid].update(extra)
-
-    save_checkpoint(
-        work_dir,
-        checkpoint
-    )
+    save_checkpoint(work_dir, checkpoint)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Data containers  (mirrors the NWChem ThermoData / Step types)
+# Data containers
 # ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class ThermoData:
     temp:       Optional[float] = None   # K
     freq_scale: Optional[float] = None
-    zpe:        Optional[float] = None   # kcal/mol  (Zero-point correction)
-    te:         Optional[float] = None   # kcal/mol  (Thermal correction to energy)
-    th:         Optional[float] = None   # kcal/mol  (Thermal correction to enthalpy)
-    ts:         Optional[float] = None   # cal/mol·K (Total entropy)
+    zpe:        Optional[float] = None   # kcal/mol
+    te:         Optional[float] = None   # kcal/mol
+    th:         Optional[float] = None   # kcal/mol
+    ts:         Optional[float] = None   # cal/mol·K
     ts_trans:   Optional[float] = None
     ts_rot:     Optional[float] = None
     ts_vib:     Optional[float] = None
-    cv:         Optional[float] = None   # cal/mol·K (Cv)
+    cv:         Optional[float] = None   # cal/mol·K
     cv_trans:   Optional[float] = None
     cv_rot:     Optional[float] = None
     cv_vib:     Optional[float] = None
@@ -133,82 +192,69 @@ class ThermoData:
 
 @dataclass
 class OptStep:
-    step:     int
-    energy:   float   # Hartree
-    delta_e:  float
+    step:      int
+    energy:    float
+    delta_e:   float
     rms_force: float
     max_force: float
-    rms_disp: float
-    max_disp: float
+    rms_disp:  float
+    max_disp:  float
 
 
 @dataclass
 class RunResult:
-    cid:        str
-    sdf_path:   str
-    gjf_path:   str
-    log_path:   str
-    success:    bool
-    energy:     Optional[float]       = None   # Hartree
-    thermo:     Optional[ThermoData]  = None
-    opt_steps:  list[OptStep]         = field(default_factory=list)
-    error_msg:  str                   = ""
+    cid:       str
+    sdf_path:  str
+    gjf_path:  str
+    log_path:  str
+    success:   bool
+    energy:    Optional[float]      = None
+    thermo:    Optional[ThermoData] = None
+    opt_steps: list[OptStep]        = field(default_factory=list)
+    error_msg: str                  = ""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SDF → XYZ coordinates (element + x, y, z only, no charge column)
+# SDF → coordinate block
 # ──────────────────────────────────────────────────────────────────────────────
 
 _ATOM_LINE = re.compile(
     r"^\s*([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([A-Za-z]+)"
 )
 
-def sdf_to_xyz_block(sdf_path: str) -> tuple[str, int]:
-    """
-    Extract the atom-coordinate block from an SDF / MOL file.
 
-    Returns
-    -------
-    xyz_block : str
-        Newline-joined "  Element   x   y   z" lines (Gaussian molecule-spec format).
-    n_atoms : int
-        Number of atoms found.
-    """
+def sdf_to_xyz_block(sdf_path: str) -> tuple[str, int]:
     with open(sdf_path) as fh:
         lines = fh.readlines()
 
-    # Counts line is line index 3 in a V2000 MOL block: aaabbblllfffcccsssxxxrrrpppiiimmmvvvvvv
-    # Robust approach: just scan for coordinate lines after the counts line.
     coords: list[str] = []
     in_atom_block = False
     atom_count = 0
 
     for i, line in enumerate(lines):
         if i == 3:
-            # V2000 counts line: first 3 chars = num atoms
             try:
                 atom_count = int(line[:3].strip())
                 in_atom_block = True
             except ValueError:
                 pass
             continue
-
         if in_atom_block:
             if len(coords) >= atom_count:
                 break
             m = _ATOM_LINE.match(line)
             if m:
                 x, y, z, elem = m.group(1), m.group(2), m.group(3), m.group(4)
-                coords.append(f"  {elem:<3} {float(x):>14.8f} {float(y):>14.8f} {float(z):>14.8f}")
+                coords.append(
+                    f"  {elem:<3} {float(x):>14.8f} {float(y):>14.8f} {float(z):>14.8f}"
+                )
 
     if not coords:
         raise ValueError(f"No atomic coordinates found in {sdf_path}")
-
     return "\n".join(coords), len(coords)
 
 
 def read_xyz_file(xyz_file: str) -> str:
-    """Read coordinates from a standard .xyz file (skip first two header lines)."""
     coords: list[str] = []
     with open(xyz_file) as fh:
         for i, line in enumerate(fh):
@@ -228,39 +274,65 @@ def read_xyz_file(xyz_file: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def build_gjf(
-    coord_block: str,
-    chk_path: str,
+    coord_block:    str,
+    chk_path:       str,
     *,
-    basis_set:    str  = "6-31G*",
-    charge:       int  = 0,
-    multiplicity: int  = 1,
-    method:       str  = "PBE0",
-    operation:    str  = "opt freq",   # e.g. "sp", "opt", "opt freq"
-    nproc:        int  = 10,
-    mem:          str  = "8GB",
-    title:        str  = "Gaussian 16 DFT Calculation",
-    extra_keywords: str = "",          # e.g. "empiricaldispersion=gd3bj"
-    cosmo:        bool = False,        # SCRF=(CPCM,Solvent=Water)
+    basis_set:      str           = "6-311G*",
+    charge:         int           = 0,
+    multiplicity:   int           = 1,
+    method:         str           = "PBE0",
+    operation:      str           = "opt freq",
+    nproc:          int           = 10,
+    mem:            str           = "28GB",
+    title:          str           = "Gaussian 16 DFT Calculation",
+    extra_keywords: str           = "NoTestMO SCF=(XQC,MaxCycle=200)",
+    cosmo:          bool          = False,
+    # ── Scratch / disk controls (the fix) ────────────────────────────────────
+    scratch_dir:    Optional[str] = None,   # if set, explicit %RWF path
+    cid:            str           = "mol",  # used to name the .rwf file
+    max_disk:       Optional[str] = None,   # e.g. "60GB" → MaxDisk=60GB keyword
 ) -> str:
     """
     Generate a Gaussian 16 .gjf input string.
 
-    Gaussian keyword line structure:
-        #p method/basis operation [options]
+    Scratch strategy
+    ----------------
+    %NoSave is ALWAYS written.  This tells Gaussian to delete the .rwf
+    scratch file on normal termination, which is the single most important
+    fix for runaway disk usage.
 
-    Parameters map to NWChem equivalents:
-        method      ← method + functional  (NWChem splits these; Gaussian combines)
-        operation   ← task keyword         (opt / freq / opt freq / sp)
-        cosmo       ← cosmo block          (uses CPCM in Gaussian)
+    If scratch_dir is provided we also write an explicit %RWF line so that
+    the scratch file goes to a known location (useful if $GAUSS_SCRDIR isn't
+    set, or if you want per-job files on a fast NVMe vs your home dir).
+
+    MaxDisk gives Gaussian a hard cap; it will abort cleanly rather than
+    filling the disk.  Strongly recommended for WSL where OOM kills leave
+    partial .rwf files that never get cleaned up.
+
+    extra_keywords:
+        Default is "NoTestMO SCF=(XQC,MaxCycle=200)" to avoid crashes from
+        large MO coefficients (linear dependence) and improve SCF convergence.
     """
-    solvent_kw = " scrf=(cpcm,solvent=water)" if cosmo else ""
-    extra = f" {extra_keywords.strip()}" if extra_keywords.strip() else ""
+    solvent_kw  = " scrf=(cpcm,solvent=water)" if cosmo else ""
+    extra       = f" {extra_keywords.strip()}" if extra_keywords.strip() else ""
+    max_disk_kw = f" MaxDisk={max_disk}" if max_disk else ""
+
+    # Always delete .rwf on normal termination
+    nosave_line = "%NoSave\n"
+
+    # Optional explicit .rwf location — useful when scratch_dir != $GAUSS_SCRDIR
+    rwf_line = ""
+    if scratch_dir:
+        rwf_path = str(Path(scratch_dir) / f"{cid}.rwf")
+        rwf_line = f"%RWF={rwf_path}\n"
 
     gjf = (
         f"%chk={chk_path}\n"
+        f"{rwf_line}"                    # empty string if not set
+        f"{nosave_line}"                 # ALWAYS present
         f"%nprocshared={nproc}\n"
         f"%mem={mem}\n"
-        f"#p {method}/{basis_set} {operation}{solvent_kw}{extra}\n"
+        f"#p {method}/{basis_set} {operation}{solvent_kw}{extra}{max_disk_kw}\n"
         f"\n"
         f"{title}\n"
         f"\n"
@@ -272,12 +344,11 @@ def build_gjf(
 
 
 def sdf_to_gjf(
-    sdf_path: str,
-    gjf_path: str,
-    chk_path: str,
+    sdf_path:    str,
+    gjf_path:    str,
+    chk_path:    str,
     **kwargs,
 ) -> str:
-    """Convert an SDF file to a Gaussian .gjf input file. Returns the gjf path."""
     coord_block, _ = sdf_to_xyz_block(sdf_path)
     gjf_content = build_gjf(coord_block, chk_path, **kwargs)
     with open(gjf_path, "w") as fh:
@@ -286,12 +357,11 @@ def sdf_to_gjf(
 
 
 def xyz_to_gjf(
-    xyz_file: str,
-    gjf_path: str,
-    chk_path: str,
+    xyz_file:  str,
+    gjf_path:  str,
+    chk_path:  str,
     **kwargs,
 ) -> str:
-    """Convert an .xyz file to a Gaussian .gjf input file. Returns the gjf path."""
     coord_block = read_xyz_file(xyz_file)
     gjf_content = build_gjf(coord_block, chk_path, **kwargs)
     with open(gjf_path, "w") as fh:
@@ -304,16 +374,23 @@ def xyz_to_gjf(
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run_gaussian(
-    gjf_path: str,
-    log_path: str,
-    g16_exec: str = "g16",
-    timeout:  Optional[int] = None,   # seconds; None = no limit
+    gjf_path:    str,
+    log_path:    str,
+    g16_exec:    str           = "g16",
+    timeout:     Optional[int] = None,
+    scratch_dir: Optional[str] = None,
 ) -> tuple[bool, str]:
     """
-    Run Gaussian 16 on *gjf_path*, writing output to *log_path*.
+    Run Gaussian 16 on gjf_path, writing output to log_path.
 
-    Returns (success: bool, stderr_or_error: str).
+    If scratch_dir is provided, $GAUSS_SCRDIR is set for this subprocess only
+    (does not affect other processes or the parent environment).
     """
+    env = os.environ.copy()
+    if scratch_dir:
+        Path(scratch_dir).mkdir(parents=True, exist_ok=True)
+        env["GAUSS_SCRDIR"] = scratch_dir
+
     cmd = [g16_exec, gjf_path, log_path]
     try:
         result = subprocess.run(
@@ -321,6 +398,7 @@ def run_gaussian(
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
         if result.returncode != 0:
             return False, result.stderr.strip() or f"Exit code {result.returncode}"
@@ -338,14 +416,6 @@ def run_gaussian(
 # ──────────────────────────────────────────────────────────────────────────────
 
 def get_final_scf_energy(log_path: str) -> Optional[float]:
-    """
-    Extract the last SCF Done energy (Hartree) from a Gaussian log file.
-
-    Gaussian line format:
-        SCF Done:  E(RB3LYP) =  -154.062345678     A.U. after   12 cycles
-    Equivalent to NWChem's:
-        Total DFT energy = ...
-    """
     energy = None
     pattern = re.compile(r"SCF Done:\s+E\(\S+\)\s+=\s+([-\d.]+)")
     with open(log_path) as fh:
@@ -357,34 +427,22 @@ def get_final_scf_energy(log_path: str) -> Optional[float]:
 
 
 def get_geometries(
-    log_path: str,
+    log_path:       str,
     output_xyz_file: str,
     geometry_index: int = -1,
 ) -> None:
-    """
-    Extract optimised geometries from a Gaussian log and write to an XYZ file.
-
-    Gaussian prints geometry blocks under:
-        "Standard orientation:"   (preferred — atom-centred frame)
-    or  "Input orientation:"      (fallback)
-
-    Equivalent to NWChem's "Output coordinates in angstroms" block.
-    """
     with open(log_path) as fh:
         content = fh.read()
 
-    # Each Standard orientation block ends at a dashed separator line
     block_re = re.compile(
         r"Standard orientation:.*?-{20,}.*?-{20,}\n(.*?)-{20,}",
         re.DOTALL,
     )
-    # Row format: center_no  atomic_no  atomic_type  x  y  z
     row_re = re.compile(
         r"^\s+(\d+)\s+(\d+)\s+\d+\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)",
         re.MULTILINE,
     )
 
-    # Map atomic number → element symbol for the 118 common elements
     _Z_TO_SYM = {
         1:'H',2:'He',3:'Li',4:'Be',5:'B',6:'C',7:'N',8:'O',9:'F',10:'Ne',
         11:'Na',12:'Mg',13:'Al',14:'Si',15:'P',16:'S',17:'Cl',18:'Ar',
@@ -405,7 +463,7 @@ def get_geometries(
             center_no, atomic_no, x, y, z = row
             sym = _Z_TO_SYM.get(int(atomic_no), f"X{atomic_no}")
             geom.append({"Atom_No": int(center_no), "Atom_Tag": sym,
-                          "X": float(x), "Y": float(y), "Z": float(z)})
+                         "X": float(x), "Y": float(y), "Z": float(z)})
         if geom:
             geometries.append(geom)
 
@@ -426,95 +484,55 @@ def get_geometries(
 
 
 def log_to_xyz(log_path: str, geometry_index: int = -1) -> str:
-    """
-    Write the selected geometry to a temp XYZ file and return its path.
-    Equivalent to NWChem's nwout_to_xyz().
-    """
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xyz")
     get_geometries(log_path, tmp.name, geometry_index=geometry_index)
     return tmp.name
 
 
 def get_thermo_data(log_path: str, *, thermo_data: Optional[ThermoData] = None) -> ThermoData:
-    """
-    Parse thermochemical data from a Gaussian 16 frequency log.
-
-    Gaussian thermo block (298.15 K, 1 atm) looks like:
-
-        Zero-point correction=           0.123456 (Hartree/Particle)
-        Thermal correction to Energy=    0.131234
-        Thermal correction to Enthalpy=  0.132178
-        Thermal correction to Gibbs Free Energy= 0.098765
-        Sum of electronic and zero-point Energies= -154.123456
-        ...
-        Zero-point Energy=          77.5 kcal/mol
-        ...
-        Temperature   298.150 Kelvin.  Pressure   1.00000 Atm.
-        ...
-        E (Thermal)   CV            S
-        KCal/Mol    Cal/Mol-Kelvin  Cal/Mol-Kelvin
-        Total    XX.XXX    XX.XXX    XXX.XXX
-        Electronic   0.000     0.000     0.000
-        Translational  X.XXX    2.981    XX.XXX
-        Rotational   X.XXX    2.981    XX.XXX
-        Vibrational  X.XXX   XX.XXX    XX.XXX
-
-    Units kept identical to the NWChem equivalents for drop-in compatibility.
-    """
     if thermo_data is None:
         thermo_data = ThermoData()
 
-    # Gaussian prints corrections in Hartree; we convert to kcal/mol (×627.509)
-    # to match NWChem ThermoData units.
     HARTREE_TO_KCAL = 627.509474
-
-    in_thermo_table = False   # True once we pass the E/CV/S header
-    cv_row_seen = False       # True once we've read the "Total" CV row
+    in_thermo_table = False
+    cv_row_seen     = False
 
     with open(log_path) as fh:
         for raw_line in fh:
             line = raw_line.strip()
             ll   = line.lower()
 
-            # ── Temperature ───────────────────────────────────────────────
             if ll.startswith("temperature") and "kelvin" in ll:
                 m = re.search(r"temperature\s+([\d.]+)\s+kelvin", ll)
                 if m:
                     thermo_data.temp = float(m.group(1))
 
-            # ── Frequency scale factor ────────────────────────────────────
             elif "scale factor for frequencies" in ll:
                 m = re.search(r"scale factor for frequencies\s+=\s+([\d.]+)", ll)
                 if m:
                     thermo_data.freq_scale = float(m.group(1))
 
-            # ── ZPE (Hartree → kcal/mol) ──────────────────────────────────
             elif ll.startswith("zero-point correction="):
                 m = re.search(r"=\s+([-\d.]+)", line)
                 if m:
                     thermo_data.zpe = float(m.group(1)) * HARTREE_TO_KCAL
 
-            # ── Thermal correction to Energy ──────────────────────────────
             elif ll.startswith("thermal correction to energy="):
                 m = re.search(r"=\s+([-\d.]+)", line)
                 if m:
                     thermo_data.te = float(m.group(1)) * HARTREE_TO_KCAL
 
-            # ── Thermal correction to Enthalpy ────────────────────────────
             elif ll.startswith("thermal correction to enthalpy="):
                 m = re.search(r"=\s+([-\d.]+)", line)
                 if m:
                     thermo_data.th = float(m.group(1)) * HARTREE_TO_KCAL
 
-            # ── Enter the E / Cv / S table ────────────────────────────────
             elif "e (thermal)" in ll and "cv" in ll:
                 in_thermo_table = True
 
             elif in_thermo_table:
-                # "Total" row gives S and Cv
                 if ll.startswith("total"):
                     parts = line.split()
-                    # Total  E_therm  Cv  S
                     if len(parts) >= 4:
                         try:
                             thermo_data.cv = float(parts[2])
@@ -556,7 +574,6 @@ def get_thermo_data(log_path: str, *, thermo_data: Optional[ThermoData] = None) 
                         except ValueError:
                             pass
 
-                # Leave the table on a blank line
                 elif line == "":
                     in_thermo_table = False
 
@@ -564,26 +581,10 @@ def get_thermo_data(log_path: str, *, thermo_data: Optional[ThermoData] = None) 
 
 
 def get_opt_steps(log_path: str, step_index: int = -1) -> Optional[OptStep]:
-    """
-    Parse geometry optimisation convergence steps from a Gaussian log.
-
-    Gaussian prints a summary table for each macro-iteration:
-
-        Item           Value     Threshold  Converged?
-        Maximum Force  0.000456  0.000450     NO
-        RMS     Force  0.000123  0.000300    YES
-        Maximum Displacement  0.001234  0.001800    YES
-        RMS     Displacement  0.000456  0.001200    YES
-
-    and the energy appears on the preceding "SCF Done" line.
-
-    Equivalent to NWChem's get_step_data() (which reads @-prefixed lines).
-    """
     steps: list[OptStep] = []
-
     max_force = rms_force = max_disp = rms_disp = None
-    energy = None
-    step_no = 0
+    energy    = None
+    step_no   = 0
 
     scf_re   = re.compile(r"SCF Done:\s+E\(\S+\)\s+=\s+([-\d.]+)")
     force_re = re.compile(
@@ -609,20 +610,13 @@ def get_opt_steps(log_path: str, step_index: int = -1) -> Optional[OptStep]:
                 elif "RMS" in label and "Displacement" in label:
                     rms_disp = val
 
-                # All four items collected → record the step
                 if all(v is not None for v in [max_force, rms_force, max_disp, rms_disp, energy]):
                     step_no += 1
-                    delta_e = (
-                        energy - steps[-1].energy if steps else 0.0
-                    )
+                    delta_e = energy - steps[-1].energy if steps else 0.0
                     steps.append(OptStep(
-                        step=step_no,
-                        energy=energy,
-                        delta_e=delta_e,
-                        rms_force=rms_force,
-                        max_force=max_force,
-                        rms_disp=rms_disp,
-                        max_disp=max_disp,
+                        step=step_no, energy=energy, delta_e=delta_e,
+                        rms_force=rms_force, max_force=max_force,
+                        rms_disp=rms_disp, max_disp=max_disp,
                     ))
                     max_force = rms_force = max_disp = rms_disp = None
 
@@ -634,10 +628,8 @@ def get_opt_steps(log_path: str, step_index: int = -1) -> Optional[OptStep]:
 
 
 def check_normal_termination(log_path: str) -> bool:
-    """Return True if Gaussian ended with 'Normal termination'."""
     try:
         with open(log_path) as fh:
-            # Only need to check the last few lines
             tail = fh.read()[-4096:]
         return "Normal termination" in tail
     except OSError:
@@ -645,20 +637,10 @@ def check_normal_termination(log_path: str) -> bool:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Thermochemistry helpers  (same API as the NWChem get_g / redox_potential)
+# Thermochemistry helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
 def compute_gibbs(energy_hartree: float, thermo: ThermoData) -> Optional[float]:
-    """
-    Compute G = H - T·S (kJ/mol) from Gaussian output data.
-
-    energy_hartree : SCF Done energy in Hartree
-    thermo.th      : thermal correction to enthalpy (kcal/mol, Hartree-based)
-    thermo.ts      : total entropy (cal/mol·K)
-    thermo.temp    : temperature (K)
-
-    Returns G in kJ/mol, consistent with the NWChem pipeline's get_g().
-    """
     HARTREE_TO_KJMOL = 2625.5
     KCAL_TO_KJ       = 4.184
     CAL_TO_KJ        = 4.184 / 1000.0
@@ -666,26 +648,19 @@ def compute_gibbs(energy_hartree: float, thermo: ThermoData) -> Optional[float]:
     if thermo.th is None or thermo.ts is None or thermo.temp is None:
         return None
 
-    # Enthalpy: H = E + H_corr  (everything in kJ/mol)
     H = energy_hartree * HARTREE_TO_KJMOL + thermo.th * KCAL_TO_KJ
-    S = thermo.ts * CAL_TO_KJ   # kJ/mol·K
-    G = H - thermo.temp * S
-    return G
+    S = thermo.ts * CAL_TO_KJ
+    return H - thermo.temp * S
 
 
 def redox_potential(
-    g_red:     float,   # G of reduced species (gas phase)
-    g_ox:      float,   # G of oxidised species (gas phase)
-    g_sol_red: float,   # G of reduced species (solution)
-    g_sol_ox:  float,   # G of oxidised species (solution)
+    g_red:     float,
+    g_ox:      float,
+    g_sol_red: float,
+    g_sol_ox:  float,
 ) -> float:
-    """
-    Compute the redox potential (V) from four Gibbs free energies (kJ/mol).
-    Matches the NWChem redox_potential() formula exactly.
-    """
     g_total = g_red - g_ox + (g_sol_red - g_red) - (g_sol_ox - g_ox)
-    e_total = -g_total / 96.5   # 96.5 kJ/mol per eV ≈ Faraday constant
-    return e_total
+    return -g_total / 96.5
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -693,30 +668,37 @@ def redox_potential(
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run_compound(
-    sdf_path:    str,
-    work_dir:    str,
-    g16_exec:    str   = "g16",
-    basis_set:   str   = "6-311G*",
-    method:      str   = "PBE0",
-    operation:   str   = "opt freq",
-    charge:      int   = 0,
-    multiplicity: int  = 1,
-    nproc:       Optional[int] = None,
-    mem:         str   = "4GB",
-    cosmo:       bool  = False,
-    timeout:     Optional[int] = None,
+    sdf_path:     str,
+    work_dir:     str,
+    g16_exec:     str           = "g16",
+    basis_set:    str           = "6-311G*",
+    method:       str           = "PBE0",
+    operation:    str           = "opt freq",
+    charge:       int           = 0,
+    multiplicity: int           = 1,
+    nproc:        Optional[int] = None,
+    mem:          str           = "28GB",
+    cosmo:        bool          = False,
+    timeout:      Optional[int] = None,
+    scratch_dir:  Optional[str] = None,
+    max_disk:     Optional[str] = None,
 ) -> RunResult:
     sdf_path = str(sdf_path)
     cid      = Path(sdf_path).stem
-    work_dir = Path(work_dir) / cid
-    work_dir.mkdir(parents=True, exist_ok=True)
+    job_dir  = Path(work_dir) / cid
+    job_dir.mkdir(parents=True, exist_ok=True)
 
-    gjf_path = str(work_dir / f"{cid}.gjf")
-    chk_path = str(work_dir / f"{cid}.chk")
-    log_path = str(work_dir / f"{cid}.log")
+    gjf_path = str(job_dir / f"{cid}.gjf")
+    chk_path = str(job_dir / f"{cid}.chk")
+    log_path = str(job_dir / f"{cid}.log")
 
     effective_nproc = nproc if nproc is not None else os.cpu_count() or 4
 
+    # ── Pre-run: clear any leftover scratch from a previous crashed run ───────
+    resolved_scratch = get_scratch_dir(scratch_dir)
+    cleanup_scratch_for_cid(resolved_scratch, cid)
+
+    # ── Build .gjf ────────────────────────────────────────────────────────────
     try:
         sdf_to_gjf(
             sdf_path, gjf_path, chk_path,
@@ -724,21 +706,38 @@ def run_compound(
             charge=charge, multiplicity=multiplicity,
             nproc=effective_nproc, mem=mem, cosmo=cosmo,
             title=f"CID {cid}",
+            scratch_dir=resolved_scratch,
+            cid=cid,
+            max_disk=max_disk,
         )
     except Exception as exc:
         return RunResult(
             cid=cid, sdf_path=sdf_path, gjf_path=gjf_path,
-            log_path=log_path, success=False, error_msg=f"GJF build failed: {exc}",
+            log_path=log_path, success=False,
+            error_msg=f"GJF build failed: {exc}",
         )
 
-    ok, err = run_gaussian(gjf_path, log_path, g16_exec=g16_exec, timeout=timeout)
+    # ── Run Gaussian ──────────────────────────────────────────────────────────
+    ok, err = run_gaussian(
+        gjf_path, log_path,
+        g16_exec=g16_exec,
+        timeout=timeout,
+        scratch_dir=resolved_scratch,
+    )
+
+    # ── Post-run: if job failed/crashed, clean up any leftover scratch ────────
     if not ok or not check_normal_termination(log_path):
+        cleanup_scratch_for_cid(resolved_scratch, cid)
         return RunResult(
             cid=cid, sdf_path=sdf_path, gjf_path=gjf_path,
             log_path=log_path, success=False,
             error_msg=err or "Abnormal termination",
         )
 
+    # %NoSave handles deletion on normal termination, but clean up anyway
+    cleanup_scratch_for_cid(resolved_scratch, cid)
+
+    # ── Parse results ─────────────────────────────────────────────────────────
     energy    = get_final_scf_energy(log_path)
     thermo    = get_thermo_data(log_path) if "freq" in operation.lower() else None
     opt_steps = []
@@ -747,214 +746,103 @@ def run_compound(
         if step:
             opt_steps.append(step)
 
-    return RunResult(                          # ← this was missing
+    return RunResult(
         cid=cid, sdf_path=sdf_path, gjf_path=gjf_path,
         log_path=log_path, success=True,
         energy=energy, thermo=thermo, opt_steps=opt_steps,
     )
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Batch runner
 # ──────────────────────────────────────────────────────────────────────────────
 
 def batch_run(
-    sdf_dir: str,
-    work_dir: str,
-    jobs: int = 1,
-    resume: bool = True,       # ← add this
-    checkpoint: str = None,    # ← add this (unused; work_dir-based path is used internally)
+    sdf_dir:     str,
+    work_dir:    str,
+    jobs:        int           = 1,
+    resume:      bool          = True,
+    scratch_dir: Optional[str] = None,
+    checkpoint:  Optional[str] = None,   # accepted but unused (path derived from work_dir)
     **kwargs,
-):
+) -> list[RunResult]:
 
-    sdfs = sorted(
-        Path(sdf_dir).glob("*.sdf")
-    )
-
+    sdfs = sorted(Path(sdf_dir).glob("*.sdf"))
     if not sdfs:
-
-        print(
-            f"No SDF files found in {sdf_dir}"
-        )
-
+        print(f"No SDF files found in {sdf_dir}")
         return []
 
+    Path(work_dir).mkdir(parents=True, exist_ok=True)
 
-    Path(work_dir).mkdir(
-        parents=True,
-        exist_ok=True
-    )
+    resolved_scratch = get_scratch_dir(scratch_dir)
+    report_scratch_usage(resolved_scratch)
 
-
-    checkpoint = load_checkpoint(
-        work_dir
-    )
-
+    checkpoint = load_checkpoint(work_dir)
 
     pending = []
-
-
     for sdf in sdfs:
-
-        cid = sdf.stem
-
-        status = (
-            checkpoint["jobs"]
-            .get(cid, {})
-            .get("status")
-        )
-
-
-        if status == "completed":
-
-            print(
-                f"Skipping {cid} (already completed)"
-            )
-
+        cid    = sdf.stem
+        status = checkpoint["jobs"].get(cid, {}).get("status")
+        if resume and status == "completed":
+            print(f"Skipping {cid} (already completed)")
             continue
-
-
         pending.append(sdf)
 
+    print(f"\nGaussian batch:"
+          f"\n  Total     : {len(sdfs)}"
+          f"\n  Done      : {len(sdfs) - len(pending)}"
+          f"\n  Remaining : {len(pending)}"
+          f"\n  Scratch   : {resolved_scratch}\n")
 
-
-    print(
-        f"""
-Gaussian checkpoint:
-
-Total molecules : {len(sdfs)}
-Already done    : {len(sdfs)-len(pending)}
-Remaining       : {len(pending)}
-"""
-    )
-
-
-    results = []
-
-
-    interrupted = False
-
+    results: list[RunResult] = []
 
     try:
-
-        for i, sdf in enumerate(
-            pending,
-            1
-        ):
-
+        for i, sdf in enumerate(pending, 1):
             cid = sdf.stem
-
-
-            print(
-                f"[{i}/{len(pending)}] {cid}",
-                flush=True
-            )
-
-
-            update_checkpoint(
-                work_dir,
-                cid,
-                "running"
-            )
-
+            print(f"[{i}/{len(pending)}] {cid}", flush=True)
+            update_checkpoint(work_dir, cid, "running")
 
             try:
-
                 result = run_compound(
-                    str(sdf),
-                    work_dir,
-                    **kwargs
+                    str(sdf), work_dir,
+                    scratch_dir=resolved_scratch,
+                    **kwargs,
                 )
-
             except KeyboardInterrupt:
-
-                update_checkpoint(
-                    work_dir,
-                    cid,
-                    "interrupted"
-                )
-
+                # Clean scratch before propagating
+                cleanup_scratch_for_cid(resolved_scratch, cid)
+                update_checkpoint(work_dir, cid, "interrupted")
                 raise
-
             except Exception as exc:
-
+                cleanup_scratch_for_cid(resolved_scratch, cid)
                 result = RunResult(
-                    cid=cid,
-                    sdf_path=str(sdf),
-                    gjf_path="",
-                    log_path="",
-                    success=False,
-                    error_msg=str(exc),
+                    cid=cid, sdf_path=str(sdf),
+                    gjf_path="", log_path="",
+                    success=False, error_msg=str(exc),
                 )
 
-            if result is None:                    # ← guard
+            if result is None:
                 result = RunResult(
-                    cid=cid,
-                    sdf_path=str(sdf),
-                    gjf_path="",
-                    log_path="",
-                    success=False,
-                    error_msg="run_compound returned None",
+                    cid=cid, sdf_path=str(sdf),
+                    gjf_path="", log_path="",
+                    success=False, error_msg="run_compound returned None",
                 )
 
             results.append(result)
 
             if result.success:
-
-                update_checkpoint(
-                    work_dir,
-                    cid,
-                    "completed",
-                    {
-                        "energy":
-                            result.energy
-                    }
-                )
-
+                update_checkpoint(work_dir, cid, "completed", {"energy": result.energy})
             else:
+                update_checkpoint(work_dir, cid, "failed", {"error": result.error_msg})
 
-                update_checkpoint(
-                    work_dir,
-                    cid,
-                    "failed",
-                    {
-                        "error":
-                            result.error_msg
-                    }
-                )
-
-
-            _print_result(
-                result
-            )
-
+            _print_result(result)
+            report_scratch_usage(resolved_scratch)   # show scratch state after each job
 
     except KeyboardInterrupt:
-
-        print(
-            "\n\nGaussian interrupted."
-        )
-
-        print(
-            "Checkpoint saved."
-        )
-
-        print(
-            "Run the same command again to resume."
-        )
-
-        interrupted = True
-
-
+        print("\n\nInterrupted. Checkpoint saved. Run again to resume.")
 
     finally:
-
-        _write_summary(
-            results,
-            Path(work_dir)
-            /
-            "batch_summary.tsv"
-        )
-
+        _write_summary(results, Path(work_dir) / "batch_summary.tsv")
 
     return results
 
@@ -976,46 +864,97 @@ def _write_summary(results: list[RunResult], path: Path) -> None:
         w = csv.DictWriter(fh, fieldnames=fields, delimiter="\t")
         w.writeheader()
         for r in results:
-            if r is None:               # ← guard
+            if r is None:
                 continue
             w.writerow({
-                "cid":        r.cid,
-                "success":    r.success,
-                "energy_ha":  r.energy if r.energy is not None else "",
-                "temp_K":     r.thermo.temp  if r.thermo else "",
-                "zpe_kcal":   r.thermo.zpe   if r.thermo else "",
-                "th_kcal":    r.thermo.th    if r.thermo else "",
-                "ts_cal_K":   r.thermo.ts    if r.thermo else "",
-                "error_msg":  r.error_msg,
+                "cid":       r.cid,
+                "success":   r.success,
+                "energy_ha": r.energy if r.energy is not None else "",
+                "temp_K":    r.thermo.temp if r.thermo else "",
+                "zpe_kcal":  r.thermo.zpe  if r.thermo else "",
+                "th_kcal":   r.thermo.th   if r.thermo else "",
+                "ts_cal_K":  r.thermo.ts   if r.thermo else "",
+                "error_msg": r.error_msg,
             })
     print(f"Summary written to {path}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CLI entry point
+# CLI
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="Gaussian 16 local pipeline (SDF → .gjf → g16 → parse)")
+    parser = argparse.ArgumentParser(
+        description="Gaussian 16 local pipeline (SDF → .gjf → g16 → parse)"
+    )
 
     src = parser.add_mutually_exclusive_group(required=True)
-    src.add_argument("--sdf",     help="Single SDF file")
+    src.add_argument("--sdf",      help="Single SDF file")
     src.add_argument("--sdf-dir", help="Directory of SDF files (batch mode)")
 
-    parser.add_argument("--workdir",      default="./g16_runs",   help="Working / output directory")
-    parser.add_argument("--g16",          default="g16",           help="Gaussian 16 executable name or path")
-    parser.add_argument("--basis",        default="6-311G*",        help="Basis set (default: 6-311G*)")
-    parser.add_argument("--method",       default="PBE0",         help="DFT functional (default: PBE0)")
-    parser.add_argument("--operation",    default="opt freq",      help="Gaussian task keywords (default: 'opt freq')")
-    parser.add_argument("--charge",       default=0,  type=int,    help="Molecular charge (default: 0)")
-    parser.add_argument("--mult",         default=1,  type=int,    help="Spin multiplicity (default: 1)")
-    parser.add_argument("--nproc",        default=10, type=int,     help="%nprocshared (default: 10)")
-    parser.add_argument("--mem",          default="4GB",           help="%%mem (default: 4GB)")
-    parser.add_argument("--cosmo",        action="store_true",     help="Enable SCRF=(CPCM,Solvent=Water)")
-    parser.add_argument("--jobs",         default=1,  type=int,    help="Parallel workers for batch (default: 1)")
-    parser.add_argument("--timeout",      default=None, type=int,  help="Per-job timeout in seconds")
+    parser.add_argument("--workdir",   default="./g16_runs", help="Working / output directory")
+    parser.add_argument("--g16",       default="g16",        help="Gaussian 16 executable")
+    parser.add_argument("--basis",     default="6-311G*",    help="Basis set")
+    parser.add_argument("--method",    default="PBE0",       help="DFT functional")
+    parser.add_argument("--operation", default="opt freq",   help="Gaussian task keywords")
+    parser.add_argument("--charge",    default=0,  type=int, help="Molecular charge")
+    parser.add_argument("--mult",      default=1,  type=int, help="Spin multiplicity")
+    parser.add_argument("--nproc",     default=10, type=int, help="%nprocshared")
+    parser.add_argument("--mem",       default="28GB",       help="%mem")
+    parser.add_argument("--cosmo",     action="store_true",  help="SCRF=(CPCM,Solvent=Water)")
+    parser.add_argument("--jobs",      default=1,  type=int, help="Parallel workers (batch)")
+    parser.add_argument("--timeout",   default=None, type=int, help="Per-job timeout (seconds)")
+
+    # ── Scratch controls ──────────────────────────────────────────────────────
+    parser.add_argument(
+        "--scratch",
+        default=None,
+        help=(
+            "Scratch directory for Gaussian .rwf files. "
+            "Overrides $GAUSS_SCRDIR. "
+            "Files are deleted after each job (%NoSave + explicit cleanup). "
+            "Example: --scratch /fast/nvme/g16scratch"
+        ),
+    )
+    parser.add_argument(
+        "--max-disk",
+        default=None,
+        dest="max_disk",
+        help=(
+            "Hard disk cap passed as MaxDisk=X to Gaussian. "
+            "Gaussian aborts cleanly instead of filling the disk. "
+            "Example: --max-disk 60GB"
+        ),
+    )
+    parser.add_argument(
+        "--clean-scratch",
+        action="store_true",
+        dest="clean_scratch",
+        help=(
+            "Wipe ALL Gaussian scratch files from the scratch directory "
+            "before starting. Use after a crash left orphaned .rwf files."
+        ),
+    )
+    parser.add_argument(
+        "--extra_keywords",
+        default="NoTestMO SCF=(XQC,MaxCycle=200)",
+        help=(
+            "Extra keywords for Gaussian route line. "
+            "Default: NoTestMO SCF=(XQC,MaxCycle=200) "
+            "(avoids MO coefficient crash and improves SCF convergence). "
+            "Example: --extra_keywords 'NoTestMO Int=UltraFine'"
+        ),
+    )
 
     args = parser.parse_args(argv)
+
+    resolved_scratch = get_scratch_dir(args.scratch)
+
+    if args.clean_scratch:
+        print(f"Cleaning scratch directory: {resolved_scratch}")
+        cleanup_all_scratch(resolved_scratch)
+
+    report_scratch_usage(resolved_scratch)
 
     kwargs = dict(
         g16_exec=args.g16,
@@ -1028,6 +967,9 @@ def main(argv=None) -> int:
         mem=args.mem,
         cosmo=args.cosmo,
         timeout=args.timeout,
+        scratch_dir=resolved_scratch,
+        max_disk=args.max_disk,
+        extra_keywords=args.extra_keywords,
     )
 
     if args.sdf:
@@ -1042,7 +984,11 @@ def main(argv=None) -> int:
         return 0 if r.success else 1
 
     else:
-        results = batch_run(args.sdf_dir, args.workdir, jobs=args.jobs, **kwargs)
+        results = batch_run(
+            args.sdf_dir, args.workdir,
+            jobs=args.jobs,
+            **kwargs,
+        )
         return 0 if all(r.success for r in results) else 1
 
 
