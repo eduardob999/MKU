@@ -12,12 +12,13 @@ The workflow is intentionally vectorized for scale and easy extension.
 """
 
 import argparse
-import os
 import re
 from typing import Dict, List
 
 import numpy as np
 import pandas as pd
+
+from ivette.util.text import extract_numeric
 
 PARSER_ARTIFACT_NAMES = [
     "Quantity",
@@ -126,7 +127,6 @@ SOURCE_PRIORITY = {
     "PubChem": 2,
 }
 
-NUMERIC_REGEX = re.compile(r"([-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)")
 URL_REGEX = re.compile(r"^\s*(https?://|www\.)", flags=re.IGNORECASE)
 DB_REF_REGEX = re.compile(r"^\s*[A-Za-z]{1,10}:[^\s]+\s*$")
 
@@ -187,18 +187,6 @@ def standardize_property_name(name: str) -> str:
         return np.nan
     normalized = name.strip().lower()
     return PROPERTY_NAME_MAPPING.get(normalized, name.strip())
-
-
-def extract_numeric_value(value: str) -> float:
-    if not isinstance(value, str) or not value.strip():
-        return np.nan
-    match = NUMERIC_REGEX.search(value)
-    if not match:
-        return np.nan
-    try:
-        return float(match.group(1))
-    except ValueError:
-        return np.nan
 
 
 def clean_unit_text(unit: str) -> str:
@@ -263,7 +251,8 @@ def apply_standardization(df: pd.DataFrame) -> pd.DataFrame:
     df["ReactionEquation"] = normalize_text(df["ReactionEquation"])
     df["SourceURL"] = normalize_text(df["SourceURL"])
     df["StandardPropertyName"] = df["PropertyName"].map(standardize_property_name)
-    df["NumericValue"] = df["PropertyValue"].map(extract_numeric_value)
+    # extract_numeric returns None for non-numeric; astype gives a float NaN column.
+    df["NumericValue"] = df["PropertyValue"].map(extract_numeric).astype("float64")
     df = standardize_units(df)
     return df
 

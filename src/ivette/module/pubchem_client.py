@@ -1,19 +1,20 @@
 """PubChem REST and PUG-View data fetching."""
 import html
 import re
-import requests
 from html.parser import HTMLParser
 
-PUBCHEM_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
-PUBCHEM_PUG_VIEW_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound"
+from ivette.util import http
+
+PUBCHEM_BASE = http.PUBCHEM_PUG
+PUBCHEM_PUG_VIEW_BASE = http.PUBCHEM_PUG_VIEW
 
 
 def get_pubchem_details(cid: str) -> dict:
     result = {"name": "", "cas": "", "inchi": "", "synonyms": []}
     try:
-        r = requests.get(f"{PUBCHEM_BASE}/compound/cid/{cid}/synonyms/JSON", timeout=30)
-        r.raise_for_status()
-        info = r.json().get("InformationList", {}).get("Information", [])
+        info = http.get_json(
+            f"{PUBCHEM_BASE}/compound/cid/{cid}/synonyms/JSON"
+        ).get("InformationList", {}).get("Information", [])
         if info and "Synonym" in info[0]:
             result["synonyms"] = info[0]["Synonym"]
             for s in result["synonyms"]:
@@ -27,17 +28,17 @@ def get_pubchem_details(cid: str) -> dict:
     except Exception:
         pass
     try:
-        r = requests.get(f"{PUBCHEM_BASE}/compound/cid/{cid}/xrefs/RN/JSON", timeout=30)
-        r.raise_for_status()
-        info = r.json().get("InformationList", {}).get("Information", [])
+        info = http.get_json(
+            f"{PUBCHEM_BASE}/compound/cid/{cid}/xrefs/RN/JSON"
+        ).get("InformationList", {}).get("Information", [])
         if info and "RN" in info[0] and info[0]["RN"]:
             result["cas"] = result["cas"] or info[0]["RN"][0]
     except Exception:
         pass
     try:
-        r = requests.get(f"{PUBCHEM_BASE}/compound/cid/{cid}/property/InChI/JSON", timeout=30)
-        r.raise_for_status()
-        info = r.json().get("PropertyTable", {}).get("Properties", [])
+        info = http.get_json(
+            f"{PUBCHEM_BASE}/compound/cid/{cid}/property/InChI/JSON"
+        ).get("PropertyTable", {}).get("Properties", [])
         if info and "InChI" in info[0]:
             result["inchi"] = info[0]["InChI"]
     except Exception:
@@ -162,17 +163,17 @@ def extract_pubchem_property_rows_from_html(html_text: str) -> list[dict]:
 
 def fetch_pubchem_property_rows(cid: str) -> list[dict]:
     try:
-        r = requests.get(f"{PUBCHEM_PUG_VIEW_BASE}/{cid}/JSON", timeout=30)
-        r.raise_for_status()
-        rows = extract_pubchem_property_rows_from_pug(r.json())
+        rows = extract_pubchem_property_rows_from_pug(
+            http.get_json(f"{PUBCHEM_PUG_VIEW_BASE}/{cid}/JSON")
+        )
         if rows:
             return rows
     except Exception:
         pass
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}
-        r = requests.get(f"https://pubchem.ncbi.nlm.nih.gov/compound/{cid}", headers=headers, timeout=30)
-        r.raise_for_status()
-        return extract_pubchem_property_rows_from_html(r.text)
+        text = http.get_text(
+            f"{http.PUBCHEM_COMPOUND}/{cid}", headers=http.BROWSER_HEADERS
+        )
+        return extract_pubchem_property_rows_from_html(text)
     except Exception:
         return []

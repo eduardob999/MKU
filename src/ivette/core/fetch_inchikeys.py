@@ -1,78 +1,35 @@
 #!/usr/bin/env python3
-"""
-fetch_inchikeys.py
-
-Fetch InChIKeys from PubChem for a list of CIDs.
-
-Usage:
-  python fetch_inchikeys.py --input wide.csv --output cid_inchikey.csv
-"""
+"""Fetch InChIKeys (and SMILES) from PubChem for a list of CIDs."""
 
 import argparse
 import csv
 import sys
 import time
 
-import requests
+from ivette.util import http
+from ivette.util.text import chunked
 
-PUBCHEM_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
-
-
-def chunked(iterable, size):
-    for i in range(0, len(iterable), size):
-        yield iterable[i:i + size]
+PROPERTIES = "InChIKey,IsomericSMILES,CanonicalSMILES".split(",")
 
 
 def fetch_inchikeys(cids: list[str], max_retries: int = 5, debug: bool = False) -> dict[str, dict]:
     if not cids:
         return {}
-    cid_str = ",".join(cids)
-    url = f"{PUBCHEM_BASE}/compound/cid/{cid_str}/property/InChIKey,IsomericSMILES,CanonicalSMILES/JSON"
-
-    for attempt in range(max_retries):
-        try:
-            resp = requests.get(url, timeout=60)
-            resp.raise_for_status()
-            raw = resp.json()
-            if debug and raw.get("PropertyTable", {}).get("Properties"):
-                print(f"  DEBUG first prop keys: {list(raw['PropertyTable']['Properties'][0].keys())}",
-                      file=sys.stderr)
-            props = raw.get("PropertyTable", {}).get("Properties", [])
-            return {
-                str(p["CID"]): {
-                    "InChIKey": p.get("InChIKey", ""),
-                    "SMILES": (
-                        p.get("IsomericSMILES")
-                        or p.get("CanonicalSMILES")
-                        or p.get("SMILES")
-                        or ""
-                    ),
-                }
-                for p in props
-            }
-        except (requests.exceptions.ConnectionError,
-                requests.exceptions.ChunkedEncodingError) as e:
-            wait = min(4 * (attempt + 1), 30)
-            print(f"  Connection error (attempt {attempt + 1}/{max_retries}), "
-                  f"retrying in {wait}s: {e}", file=sys.stderr)
-            time.sleep(wait)
-        except requests.HTTPError as e:
-            if resp.status_code == 400 and len(cids) > 1:
-                mid = len(cids) // 2
-                left  = fetch_inchikeys(cids[:mid], max_retries)
-                right = fetch_inchikeys(cids[mid:], max_retries)
-                return {**left, **right}
-            elif resp.status_code in (429, 500, 502, 503, 504):
-                wait = min(4 * (attempt + 1), 30)
-                print(f"  HTTP {resp.status_code} (attempt {attempt + 1}/{max_retries}), "
-                      f"retrying in {wait}s", file=sys.stderr)
-                time.sleep(wait)
-            else:
-                raise
-
-    raise requests.exceptions.ConnectionError(
-        f"Failed to fetch properties after {max_retries} attempts for {len(cids)} CIDs"
-    )
+    props = http.pubchem_fetch_properties(cids, PROPERTIES, max_retries=max_retries)
+    if debug and props:
+        print(f"  DEBUG first prop keys: {list(props[0].keys())}", file=sys.stderr)
+    return {
+        str(p["CID"]): {
+            "InChIKey": p.get("InChIKey", ""),
+            "SMILES": (
+                p.get("IsomericSMILES")
+                or p.get("CanonicalSMILES")
+                or p.get("SMILES")
+                or ""
+            ),
+        }
+        for p in props
+    }
 
 
 def main(argv=None):

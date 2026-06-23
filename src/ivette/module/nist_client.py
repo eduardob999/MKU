@@ -1,7 +1,9 @@
 """NIST WebBook lookup utilities."""
 import re
 import requests
-from urllib.parse import urljoin
+
+from ivette.util import http
+from ivette.util.patterns import THERMO_REGEX
 
 NIST_BASE = "https://webbook.nist.gov/cgi/cbook.cgi"
 
@@ -12,14 +14,6 @@ NIST_KEYWORDS = [
 
 NIST_SEARCH_LINK_RE = re.compile(r'href="(/cgi/cbook.cgi\?ID=[^"&]+&Units=SI)"', re.IGNORECASE)
 TITLE_RE = re.compile(r"<title>([^<]+)</title>", re.IGNORECASE)
-
-THERMO_REGEX = re.compile(
-    r"((?:ΔH|Delta H|enthalpy|ΔS|Delta S|entropy|ΔG|Delta G|Gibbs free energy|free energy"
-    r"|heat of formation|heat of combustion)[^\.\n]{0,120}?"
-    r"[-+]?\d+(?:\.\d+)?\s*(?:kJ/mol|kJ mol-1|J/mol|J mol-1|kcal/mol|kcal mol-1"
-    r"|cal/mol|cal mol-1|kcal per mol|kJ per mol))",
-    re.IGNORECASE,
-)
 
 
 def parse_html_title(html: str) -> str:
@@ -46,19 +40,20 @@ def nist_page_snippet(html: str) -> str:
     return match.group(1).strip()[:250] if match else ""
 
 
-def query_nist(params: dict, timeout: int = 30) -> requests.Response:
-    r = requests.get(NIST_BASE, params=params, timeout=timeout)
+def query_nist(params: dict, timeout: int = http.DEFAULT_TIMEOUT) -> requests.Response:
+    r = http.get(NIST_BASE, params=params, timeout=timeout)
     r.raise_for_status()
     return r
 
 
-def follow_nist_search(name_or_id: str, query_type: str, timeout: int = 30) -> requests.Response:
+def follow_nist_search(name_or_id: str, query_type: str,
+                       timeout: int = http.DEFAULT_TIMEOUT) -> requests.Response:
     params = {query_type: name_or_id, "Units": "SI"}
     r = query_nist(params, timeout=timeout)
     if is_nist_search_results(r.text):
         link = extract_nist_search_link(r.text)
         if link:
-            r = requests.get(f"https://webbook.nist.gov{link}", timeout=timeout)
+            r = http.get(f"https://webbook.nist.gov{link}", timeout=timeout)
             r.raise_for_status()
     return r
 

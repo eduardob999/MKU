@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""
-find_thermo.py — orchestrator. All logic lives in sibling modules.
-"""
+"""find_thermo.py — orchestrator. All logic lives in sibling modules."""
 import csv
 import os
 import subprocess
 import sys
 import time
 
-import requests
-
-from ivette.module.cli import build_arg_parser, interactive_parameter_menu, Timer
+from ivette.util import http
+from ivette.util.csvio import write_csv
+from ivette.util.timing import TimingLog
+from ivette.module.cli import build_arg_parser, interactive_parameter_menu
 from ivette.module.nist_client import check_nist_entry
 from ivette.module.nist_parser import extract_nist_section_links, extract_nist_property_rows
 from ivette.module.pubchem_client import get_pubchem_details, fetch_pubchem_property_rows
@@ -77,43 +76,6 @@ def run_cleaning_pipeline(parsed_input, cleaned_output, summary_output, ml_outpu
         "--rare-output", rare_output,
         "--report-output", report_output,
     ], check=True)
-
-
-def write_csv(path, fieldnames, rows):
-    with open(path, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-
-
-class TimingLog:
-    """Accumulates partial timing entries and writes them to a log file on flush."""
-
-    def __init__(self, path: str):
-        self.path = path
-        self.entries: list[tuple[str, float]] = []
-        self._run_start = time.time()
-        with open(self.path, "a", encoding="utf-8") as fh:
-            fh.write(f"\n# Run started {time.strftime('%Y-%m-%dT%H:%M:%S')}\n")
-            fh.write(f"{'label':<60}  {'seconds':>10}\n")
-            fh.write("-" * 74 + "\n")
-
-    def record(self, label: str, elapsed: float) -> None:
-        self.entries.append((label, elapsed))
-        # Append immediately so partial progress is visible if the run is interrupted.
-        with open(self.path, "a", encoding="utf-8") as fh:
-            fh.write(f"{label:<60}  {elapsed:>10.3f}\n")
-
-    def finalize(self, compound_count: int = 0) -> None:
-        total = time.time() - self._run_start
-        with open(self.path, "a", encoding="utf-8") as fh:
-            fh.write("-" * 74 + "\n")
-            fh.write(f"{'TOTAL':<60}  {total:>10.3f}\n")
-            if compound_count:
-                rate = compound_count / total if total > 0 else 0.0
-                fh.write(f"{'COMPOUNDS PROCESSED':<60}  {compound_count:>10}\n")
-                fh.write(f"{'COMPOUNDS/SEC':<60}  {rate:>10.3f}\n")
 
 
 def main(argv=None):
@@ -184,12 +146,11 @@ def main(argv=None):
                 t0 = time.perf_counter()
                 for section in extract_nist_section_links(nist["NIST_HTML"], nist["NIST_URL"]):
                     try:
-                        resp = requests.get(section["url"], timeout=30)
-                        resp.raise_for_status()
+                        section_html = http.get_text(section["url"])
                         sec_name = section["section"]
                         if sec_name.lower().endswith(" data"):
                             sec_name = sec_name[:-5].strip()
-                        parsed_rows.extend(extract_nist_property_rows(resp.text, {
+                        parsed_rows.extend(extract_nist_property_rows(section_html, {
                             "CID": cid, "InChIKey": inchikey, "PubChemName": name,
                             "PubChem_URL": pubchem_url, "SourceURL": section["url"],
                             "Section": sec_name, "Subsection": section["section"],

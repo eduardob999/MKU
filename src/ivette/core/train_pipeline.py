@@ -1,29 +1,13 @@
 #!/usr/bin/env python3
+"""Three-step training pipeline: fetch InChIKeys/SMILES, merge, train XGBoost."""
 
-from pathlib import Path
 import argparse
-import subprocess
-
-
-from ivette.core.fetch_inchikeys import main as fetch_inchikeys_main
-from ivette.core.train_xgboost_emfp import main as train_xgboost_main
+from pathlib import Path
 
 import pandas as pd
 
-
-def run_step(command, name):
-
-    print(f"\n{'=' * 70}")
-    print(name)
-    print(f"{'=' * 70}")
-
-    result = subprocess.run(command)
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"{name} failed with code "
-            f"{result.returncode}"
-        )
+from ivette.core.fetch_inchikeys import main as fetch_inchikeys_main
+from ivette.core.train_xgboost_emfp import main as train_xgboost_main
 
 
 def main(argv=None):

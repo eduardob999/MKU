@@ -36,6 +36,9 @@ from sklearn.metrics import (
 
 from xgboost import XGBRegressor
 
+from ivette.util.columns import is_target_column
+from ivette.util.text import slugify
+
 
 # ============================================================
 # Configuration
@@ -53,17 +56,6 @@ MIN_SAMPLES = 30
 # ============================================================
 # Column Classification
 # ============================================================
-
-def is_target_column(col: str) -> bool:
-    """Bioactivity target columns (ChEMBL assays, etc.)"""
-    return (
-        col.startswith("ChEMBL:")
-        or any(
-            token in col
-            for token in ("IC50", "EC50", " Ki", " Kd", "Potency")
-        )
-    ) and col != "ChEMBL:"   # exclude the bare sentinel column
-
 
 def classify_columns(df: pd.DataFrame, smiles_col: str):
     """
@@ -155,39 +147,6 @@ def generate_emfp_dataframe(
             for i in range(nbits)
         ]
     )
-
-
-# ============================================================
-# Target Detection
-# ============================================================
-
-def is_target_column(col):
-
-    return (
-        "ChEMBL:" in col
-        or "IC50" in col
-        or "EC50" in col
-        or "Ki" in col
-        or "Kd" in col
-        or "Potency" in col
-    )
-
-
-def select_targets(df):
-
-    targets = []
-
-    for col in df.columns:
-
-        if not is_target_column(col):
-            continue
-
-        coverage = df[col].notna().mean()
-
-        if coverage >= MIN_TARGET_COVERAGE:
-            targets.append(col)
-
-    return targets
 
 
 # ============================================================
@@ -405,14 +364,7 @@ def main(argv=None):
 
         model, report, importance = result
 
-        safe_name = (
-            target
-            .replace("/", "_")
-            .replace(":", "_")
-            .replace("[", "")
-            .replace("]", "")
-            .replace(" ", "_")
-        )
+        safe_name = slugify(target)
 
         model_file      = output_dir / f"{safe_name}.joblib"
         importance_file = output_dir / f"{safe_name}_importance.csv"

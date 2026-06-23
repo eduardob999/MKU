@@ -1,172 +1,137 @@
 #!/usr/bin/env python3
 """
-gaussian16_pipeline.py
-Local Gaussian 16 pipeline on Linux: SDF → .gjf input → run g16 → parse .log output.
+crest_gaussian_pipeline.py
+──────────────────────────
+Conformational search with CREST/xTB followed by Gaussian 16 DFT
+optimisation + frequency calculation on the lowest-energy conformers.
 
-Usage (single compound):
-    python gaussian16_pipeline.py --sdf compound.sdf --workdir ./runs
+Workflow
+────────
+  1. Flexibility check
+       RDKit counts rotatable bonds.  Rigid molecules (< --flex-threshold
+       rotatable bonds, default 3) skip CREST and go straight to Gaussian.
 
-Usage (batch over a directory of SDFs):
-    python gaussian16_pipeline.py --sdf-dir ./sdfs --workdir ./runs --jobs 4
+  2. GFN2-xTB pre-optimisation  (xTB)
+       The SDF geometry is pre-optimised at the GFN2 level before CREST
+       so the conformational search starts from a sensible structure.
 
-# Single compound, opt + freq at PBE0/6-311G*
-python gaussian16_pipeline.py --sdf 10701.sdf --workdir ./runs
+  3. Conformational search  (CREST)
+       CREST runs iMTD-GC (default) on the xTB-optimised geometry.
+       Produces a ranked ensemble in crest_conformers.xyz.
 
-# Whole SDF directory, with solvent, custom scratch dir
-python gaussian16_pipeline.py \
-    --sdf-dir ./sdfs \
-    --workdir ./runs \
-    --operation "opt freq" \
-    --basis "6-311+G(d,p)" \
-    --method "M062X" \
-    --cosmo \
-    --nproc 8 \
-    --mem 16GB \
-    --scratch /fast/scratch \
-    --max-disk 60GB
+  4. Conformer selection
+       The N lowest-energy conformers within --energy-window kcal/mol of
+       the global minimum are selected (default: top 5, window 3 kcal/mol).
 
-# If g16 isn't on PATH
-python gaussian16_pipeline.py --sdf 10701.sdf --g16 /opt/gaussian/g16/g16
+  5. Semi-empirical pre-optimisation inside Gaussian
+       Each selected conformer is pre-optimised at a cheap level of theory
+       inside Gaussian before the expensive DFT run.  This moves the
+       geometry close to the DFT minimum so the DFT optimiser converges
+       in fewer cycles and is less likely to get stuck in a saddle point.
+
+       Two methods are supported (--preopt-method):
+
+         pm7   (default)
+               Runs "#p PM7 opt" entirely inside Gaussian.  No extra binary
+               needed.  PM7 is a good general-purpose semi-empirical
+               Hamiltonian for organic/drug-like molecules.
+
+         xtb
+               Runs GFN2-xTB as a Gaussian external program via the
+               xtb_external interface ("external='xtb --oniom ...' opt").
+               Requires xTB on PATH and the xtb_external wrapper (bundled
+               with recent xTB distributions as scripts/xtb_external).
+               More accurate than PM7 for systems with heavy atoms,
+               non-covalent interactions, or unusual bonding.
+               Gaussian drives the optimiser; xTB computes energies
+               and gradients each step via the external= interface.
+
+       Failures degrade gracefully: if the preopt log does not contain
+       "Normal termination", the CREST geometry is used unchanged and a
+       warning is printed (the DFT job still runs).
+
+       Skip with --skip-preopt.
+
+  6. Gaussian DFT opt+freq
+       Each selected conformer is submitted to gaussian16_pipeline.run_compound
+       (which already splits opt and freq into separate jobs to avoid the
+       PBE0-DH bug in G16 Rev C.02).
+
+  7. Results
+       A TSV summary ranks all conformers by DFT energy and reports
+       thermochemistry for each.  The global-minimum conformer is identified.
+
+Dependencies
+────────────
+  External binaries (must be on PATH or passed via --xtb / --crest):
+    xtb   ≥ 6.5   https://github.com/grimme-lab/xtb
+    crest ≥ 3.0   https://github.com/grimme-lab/crest
+
+  Python packages:
+    rdkit   (conda: conda install -c conda-forge rdkit)
+    gaussian16_pipeline.py  (must be importable — put it in the same
+                             directory or on PYTHONPATH)
+
+Usage
+─────
+  # Single SDF, defaults (PBE0/6-311G*, top 5 conformers, 3 kcal/mol window)
+  python crest_gaussian_pipeline.py --sdf molecule.sdf --workdir ./runs
+
+  # Custom settings
+  python crest_gaussian_pipeline.py \\
+      --sdf molecule.sdf \\
+      --workdir ./runs \\
+      --method M062X --basis "6-311+G(d,p)" \\
+      --n-conformers 3 \\
+      --energy-window 2.0 \\
+      --flex-threshold 5 \\
+      --nproc 10 --mem 28GB \\
+      --scratch /fast/scratch \\
+      --max-disk 200GB \\
+      --solvent water
+
+  # Force CREST even for rigid molecules
+  python crest_gaussian_pipeline.py --sdf molecule.sdf --force-crest
+
+  # Skip CREST (go straight to Gaussian, same as gaussian16_pipeline.py)
+  python crest_gaussian_pipeline.py --sdf molecule.sdf --skip-crest
+
+  # Use xTB (via Gaussian external=) instead of PM7 for semi-empirical preopt
+  python crest_gaussian_pipeline.py --sdf molecule.sdf --preopt-method xtb
+
+  # Skip the semi-empirical preopt entirely (go CREST → DFT directly)
+  python crest_gaussian_pipeline.py --sdf molecule.sdf --skip-preopt
 """
 
 from __future__ import annotations
 
 import argparse
-import dataclasses
+import csv
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
-import json
-from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+# ── import the existing full pipeline (optional; provides g16.* primitives) ──
+# Soft-fail so this module stays importable even when the full pipeline is not
+# on the path — the driver functions that need ``g16`` will raise when called.
+try:
+    import gaussian16_pipeline as g16
+except ImportError:
+    g16 = None
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Scratch management
-# ──────────────────────────────────────────────────────────────────────────────
-
-def get_scratch_dir(scratch_arg: Optional[str] = None) -> str:
-    """
-    Resolve the scratch directory to use, in priority order:
-      1. Explicit --scratch CLI argument
-      2. $GAUSS_SCRDIR environment variable
-      3. /tmp as fallback
-    """
-    if scratch_arg:
-        return scratch_arg
-    return os.environ.get("GAUSS_SCRDIR", "/tmp")
-
-
-def cleanup_scratch_for_cid(scratch_dir: str, cid: str) -> None:
-    """
-    Remove all Gaussian scratch files for a specific CID from scratch_dir.
-    Called both before a job starts (clear previous crash debris) and after
-    a failed/interrupted job.
-
-    File types cleaned:
-        .rwf  – read-write file (the main disk hog; can be 100s of GB)
-        .skr  – scratch integral file
-        .d2e  – second derivative file
-        .int  – integral file
-        .inp  – temporary input copy
-    """
-    scratch = Path(scratch_dir)
-    patterns = [
-        f"{cid}*.rwf",
-        f"{cid}*.rwf.bak",
-        f"{cid}*.skr",
-        f"{cid}*.d2e",
-        f"{cid}*.int",
-        f"{cid}*.inp",
-    ]
-    removed = []
-    for pattern in patterns:
-        for f in scratch.glob(pattern):
-            try:
-                f.unlink()
-                removed.append(f.name)
-            except OSError as e:
-                print(f"  [scratch] Warning: could not remove {f}: {e}")
-    if removed:
-        print(f"  [scratch] Removed {len(removed)} leftover file(s): "
-              f"{', '.join(removed[:8])}{'…' if len(removed) > 8 else ''}")
-
-
-def cleanup_all_scratch(scratch_dir: str) -> None:
-    """
-    Nuclear option: remove ALL Gaussian scratch intermediates from scratch_dir.
-    Does NOT touch .chk or .log files.
-    Safe to run before a fresh batch.
-    """
-    scratch = Path(scratch_dir)
-    if not scratch.exists():
-        return
-    patterns = ["*.rwf", "*.rwf.bak", "*.skr", "*.d2e", "*.int"]
-    total = 0
-    for pattern in patterns:
-        for f in scratch.glob(pattern):
-            try:
-                f.unlink()
-                total += 1
-            except OSError:
-                pass
-    if total:
-        print(f"[scratch] Cleaned {total} stale scratch file(s) from {scratch_dir}")
-
-
-def report_scratch_usage(scratch_dir: str) -> None:
-    """Print a quick summary of what's currently in scratch_dir."""
-    scratch = Path(scratch_dir)
-    if not scratch.exists():
-        return
-    files = list(scratch.iterdir())
-    if not files:
-        print(f"[scratch] {scratch_dir} is empty.")
-        return
-    total = sum(f.stat().st_size for f in files if f.is_file())
-    print(f"[scratch] {scratch_dir}: {len(files)} files, "
-          f"{total / 1024**3:.1f} GB total")
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Checkpoint
-# ──────────────────────────────────────────────────────────────────────────────
-
-def checkpoint_path(work_dir):
-    return Path(work_dir) / "checkpoint.json"
-
-
-def load_checkpoint(work_dir):
-    path = checkpoint_path(work_dir)
-    if not path.exists():
-        return {"created": datetime.now().isoformat(), "jobs": {}}
-    with open(path) as f:
-        return json.load(f)
-
-
-def save_checkpoint(work_dir, checkpoint):
-    path = checkpoint_path(work_dir)
-    tmp = path.with_suffix(".tmp")
-    with open(tmp, "w") as f:
-        json.dump(checkpoint, f, indent=4)
-    tmp.replace(path)
-
-
-def update_checkpoint(work_dir, cid, status, extra=None):
-    checkpoint = load_checkpoint(work_dir)
-    checkpoint["jobs"].setdefault(cid, {})
-    checkpoint["jobs"][cid].update({
-        "status": status,
-        "updated": datetime.now().isoformat(),
-    })
-    if extra:
-        checkpoint["jobs"][cid].update(extra)
-    save_checkpoint(work_dir, checkpoint)
+# ── RDKit ─────────────────────────────────────────────────────────────────────
+try:
+    from rdkit import Chem
+    from rdkit.Chem import AllChem, Descriptors, rdMolDescriptors
+    RDKIT_AVAILABLE = True
+except ImportError:
+    RDKIT_AVAILABLE = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -174,709 +139,1148 @@ def update_checkpoint(work_dir, cid, status, extra=None):
 # ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
-class ThermoData:
-    temp:       Optional[float] = None   # K
-    freq_scale: Optional[float] = None
-    zpe:        Optional[float] = None   # kcal/mol
-    te:         Optional[float] = None   # kcal/mol
-    th:         Optional[float] = None   # kcal/mol
-    ts:         Optional[float] = None   # cal/mol·K
-    ts_trans:   Optional[float] = None
-    ts_rot:     Optional[float] = None
-    ts_vib:     Optional[float] = None
-    cv:         Optional[float] = None   # cal/mol·K
-    cv_trans:   Optional[float] = None
-    cv_rot:     Optional[float] = None
-    cv_vib:     Optional[float] = None
+class ConformerResult:
+    """Result for a single conformer after Gaussian DFT."""
+    rank:         int                          # 1-based rank by CREST energy
+    crest_energy: Optional[float]              # kcal/mol relative to minimum
+    gjf_path:     str
+    log_path:     str
+    success:      bool
+    dft_energy:   Optional[float] = None       # Hartree (absolute SCF energy)
+    thermo:       Optional[g16.ThermoData] = None
+    error_msg:    str = ""
 
 
 @dataclass
-class OptStep:
-    step:      int
-    energy:    float
-    delta_e:   float
-    rms_force: float
-    max_force: float
-    rms_disp:  float
-    max_disp:  float
-
-
-@dataclass
-class RunResult:
-    cid:       str
-    sdf_path:  str
-    gjf_path:  str
-    log_path:  str
-    success:   bool
-    energy:    Optional[float]      = None
-    thermo:    Optional[ThermoData] = None
-    opt_steps: list[OptStep]        = field(default_factory=list)
-    error_msg: str                  = ""
+class PipelineResult:
+    cid:              str
+    sdf_path:         str
+    flexible:         bool
+    n_rot_bonds:      int
+    crest_ran:        bool
+    n_conformers_found: int
+    n_conformers_calc:  int
+    conformers:       list[ConformerResult] = field(default_factory=list)
+    best_conformer:   Optional[ConformerResult] = None   # lowest DFT energy
+    error_msg:        str = ""
+    success:          bool = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SDF → coordinate block
+# Flexibility check
 # ──────────────────────────────────────────────────────────────────────────────
 
-_ATOM_LINE = re.compile(
-    r"^\s*([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([A-Za-z]+)"
-)
+def count_rotatable_bonds(sdf_path: str) -> int:
+    """
+    Return the number of rotatable bonds in the molecule.
+    Uses RDKit's definition: non-ring, non-terminal single bonds,
+    excluding bonds to hydrogen.
+    Falls back to 0 (treat as rigid) if RDKit is unavailable.
+    """
+    if not RDKIT_AVAILABLE:
+        print("  [flex] RDKit not available — assuming molecule is rigid.")
+        return 0
+
+    mol = Chem.MolFromMolFile(sdf_path, removeHs=False)
+    if mol is None:
+        print(f"  [flex] RDKit could not parse {sdf_path} — assuming rigid.")
+        return 0
+
+    n = rdMolDescriptors.CalcNumRotatableBonds(mol)
+    return n
 
 
-def sdf_to_xyz_block(sdf_path: str) -> tuple[str, int]:
-    with open(sdf_path) as fh:
+def is_flexible(sdf_path: str, threshold: int) -> tuple[bool, int]:
+    """Return (flexible, n_rotatable_bonds)."""
+    n = count_rotatable_bonds(sdf_path)
+    return n >= threshold, n
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# xTB pre-optimisation
+# ──────────────────────────────────────────────────────────────────────────────
+
+def xtb_preopt(
+    sdf_path:    str,
+    work_dir:    Path,
+    xtb_exec:    str = "xtb",
+    nproc:       int = 1,
+    charge:      int = 0,
+    multiplicity: int = 1,
+    solvent:     Optional[str] = None,
+) -> Optional[str]:
+    """
+    Run GFN2-xTB geometry optimisation on sdf_path.
+
+    Returns the path to the optimised SDF file, or None on failure.
+
+    xTB is run in a temporary subdirectory to keep its output files
+    (xtbopt.log, charges, wbo, …) separate from everything else.
+    The optimised geometry is converted back to SDF via RDKit so the
+    downstream code can read it with the same parser.
+    """
+    xtb_dir = work_dir / "xtb_preopt"
+    xtb_dir.mkdir(parents=True, exist_ok=True)
+
+    # xTB wants an xyz or coord input — convert from SDF
+    xyz_in = xtb_dir / "input.xyz"
+    _sdf_to_xyz(sdf_path, str(xyz_in))
+
+    uhf = multiplicity - 1   # number of unpaired electrons
+
+    cmd = [
+        xtb_exec, str(xyz_in),
+        "--opt", "tight",
+        "--gfn", "2",
+        "--chrg", str(charge),
+        "--uhf", str(uhf),
+        "--parallel", str(nproc),
+    ]
+    if solvent:
+        cmd += ["--alpb", solvent]
+
+    log_path = xtb_dir / "xtb_preopt.log"
+    print(f"  [xTB ] pre-optimising with GFN2-xTB ({nproc} threads) …")
+    try:
+        with open(log_path, "w") as lf:
+            r = subprocess.run(
+                cmd,
+                cwd=str(xtb_dir),
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+                timeout=3600,
+            )
+    except FileNotFoundError:
+        print(f"  [xTB ] ERROR: '{xtb_exec}' not found. "
+              f"Is xTB installed and on PATH?")
+        return None
+    except subprocess.TimeoutExpired:
+        print("  [xTB ] ERROR: xTB pre-optimisation timed out after 1 h.")
+        return None
+
+    # xTB writes the optimised geometry to xtbopt.xyz in the working dir
+    xtbopt_xyz = xtb_dir / "xtbopt.xyz"
+    if not xtbopt_xyz.exists():
+        print(f"  [xTB ] ERROR: xtbopt.xyz not found. "
+              f"Check {log_path} for details.")
+        return None
+
+    # Convert optimised xyz → sdf so the rest of the pipeline can read it
+    opt_sdf = xtb_dir / "xtbopt.sdf"
+    if not _xyz_to_sdf(str(xtbopt_xyz), str(opt_sdf), template_sdf=sdf_path):
+        print("  [xTB ] WARNING: xyz→sdf conversion failed; "
+              "using original SDF for CREST input.")
+        return sdf_path   # degrade gracefully
+
+    print(f"  [xTB ] pre-optimisation complete → {xtbopt_xyz.name}")
+    return str(opt_sdf)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CREST conformational search
+# ──────────────────────────────────────────────────────────────────────────────
+
+def run_crest(
+    input_sdf:   str,
+    work_dir:    Path,
+    crest_exec:  str = "crest",
+    xtb_exec:    str = "xtb",
+    nproc:       int = 4,
+    charge:      int = 0,
+    multiplicity: int = 1,
+    solvent:     Optional[str] = None,
+    energy_window: float = 6.0,    # kcal/mol — passed to CREST's --ewin
+) -> Optional[str]:
+    """
+    Run a CREST iMTD-GC conformational search.
+
+    Returns path to the conformer ensemble XYZ file (crest_conformers.xyz),
+    or None on failure.
+
+    CREST is run in its own subdirectory.  All CREST output files
+    (crest_conformers.xyz, crest_best.xyz, crest.energies, …) land there.
+    """
+    crest_dir = work_dir / "crest"
+    crest_dir.mkdir(parents=True, exist_ok=True)
+
+    # CREST prefers xyz input
+    xyz_in = crest_dir / "input.xyz"
+    _sdf_to_xyz(input_sdf, str(xyz_in))
+
+    uhf = multiplicity - 1
+
+    cmd = [
+        crest_exec, str(xyz_in),
+        "--T", str(nproc),
+        "--chrg", str(charge),
+        "--uhf", str(uhf),
+        "--ewin", str(energy_window),   # ensemble energy window in kcal/mol
+    ]
+    if solvent:
+        cmd += ["--alpb", solvent]
+
+    log_path = crest_dir / "crest.log"
+    print(f"  [CREST] running conformational search "
+          f"({nproc} threads, ewin={energy_window} kcal/mol) …")
+    try:
+        with open(log_path, "w") as lf:
+            r = subprocess.run(
+                cmd,
+                cwd=str(crest_dir),
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+                timeout=86400,   # 24 h hard cap
+            )
+    except FileNotFoundError:
+        print(f"  [CREST] ERROR: '{crest_exec}' not found. "
+              f"Is CREST installed and on PATH?")
+        return None
+    except subprocess.TimeoutExpired:
+        print("  [CREST] ERROR: CREST timed out after 24 h.")
+        return None
+
+    conformers_xyz = crest_dir / "crest_conformers.xyz"
+    if not conformers_xyz.exists():
+        print(f"  [CREST] ERROR: crest_conformers.xyz not produced. "
+              f"Check {log_path}.")
+        return None
+
+    n = _count_conformers_in_xyz(str(conformers_xyz))
+    print(f"  [CREST] search complete — {n} conformer(s) found.")
+    return str(conformers_xyz)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Conformer ensemble parsing & selection
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _count_conformers_in_xyz(xyz_path: str) -> int:
+    """Count how many structures are in a multi-structure XYZ file."""
+    count = 0
+    with open(xyz_path) as fh:
+        for line in fh:
+            line = line.strip()
+            if line.isdigit():
+                count += 1
+    return count
+
+
+def parse_crest_ensemble(
+    conformers_xyz: str,
+    n_select:       int,
+    energy_window:  float,    # kcal/mol relative to the lowest conformer
+) -> list[tuple[int, float, str]]:
+    """
+    Parse a CREST multi-XYZ conformer file and select the best conformers.
+
+    CREST orders conformers by energy (lowest first).  The comment line of
+    each structure in the file is the absolute GFN2 energy in Hartree.
+
+    Returns a list of (rank, rel_energy_kcal, xyz_block) tuples for the
+    selected conformers, sorted by energy (best first).
+
+    Selection criteria (applied in order):
+      1. Only conformers within `energy_window` kcal/mol of the minimum.
+      2. At most `n_select` conformers.
+    """
+    HARTREE_TO_KCAL = 627.509474
+
+    conformers: list[tuple[float, str]] = []   # (energy_hartree, xyz_block)
+
+    with open(conformers_xyz) as fh:
         lines = fh.readlines()
 
-    coords: list[str] = []
-    in_atom_block = False
-    atom_count = 0
-
-    for i, line in enumerate(lines):
-        if i == 3:
-            try:
-                atom_count = int(line[:3].strip())
-                in_atom_block = True
-            except ValueError:
-                pass
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line:
+            i += 1
             continue
-        if in_atom_block:
-            if len(coords) >= atom_count:
-                break
-            m = _ATOM_LINE.match(line)
-            if m:
-                x, y, z, elem = m.group(1), m.group(2), m.group(3), m.group(4)
-                coords.append(
-                    f"  {elem:<3} {float(x):>14.8f} {float(y):>14.8f} {float(z):>14.8f}"
-                )
+        if not line.isdigit():
+            i += 1
+            continue
 
-    if not coords:
-        raise ValueError(f"No atomic coordinates found in {sdf_path}")
-    return "\n".join(coords), len(coords)
+        n_atoms = int(line)
+        if i + 1 + n_atoms >= len(lines):
+            break   # truncated file
+
+        comment = lines[i + 1].strip()
+        atom_lines = lines[i + 2 : i + 2 + n_atoms]
+
+        # Parse energy from comment — CREST writes the energy (Hartree) there
+        energy_ha = _parse_energy_from_comment(comment)
+
+        xyz_block = f"{n_atoms}\n{comment}\n" + "".join(atom_lines)
+        conformers.append((energy_ha, xyz_block))
+        i += 2 + n_atoms
+
+    if not conformers:
+        return []
+
+    # Sort by energy ascending (should already be sorted, but be safe)
+    conformers.sort(key=lambda x: x[0])
+    e_min = conformers[0][0]
+
+    selected: list[tuple[int, float, str]] = []
+    for rank, (e_ha, xyz_block) in enumerate(conformers, start=1):
+        rel_kcal = (e_ha - e_min) * HARTREE_TO_KCAL
+        if rel_kcal > energy_window:
+            break   # all further conformers are outside the window
+        selected.append((rank, rel_kcal, xyz_block))
+        if len(selected) >= n_select:
+            break
+
+    return selected
 
 
-def read_xyz_file(xyz_file: str) -> str:
-    coords: list[str] = []
-    with open(xyz_file) as fh:
-        for i, line in enumerate(fh):
-            if i < 2:
-                continue
+def _parse_energy_from_comment(comment: str) -> float:
+    """
+    Extract a floating-point energy value from a CREST xyz comment line.
+    CREST writes lines like '-10.123456789' or 'conf_1 -10.123456789 Eh'.
+    Falls back to 0.0 if no number is found.
+    """
+    m = re.search(r"[-+]?\d+\.\d+", comment)
+    return float(m.group(0)) if m else 0.0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# XYZ ↔ SDF conversion helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _sdf_to_xyz(sdf_path: str, xyz_path: str) -> None:
+    """
+    Convert SDF to XYZ using RDKit if available, otherwise a minimal parser.
+    The XYZ file includes all atoms (including H).
+    """
+    if RDKIT_AVAILABLE:
+        mol = Chem.MolFromMolFile(sdf_path, removeHs=False, sanitize=False)
+        if mol is not None:
+            conf = mol.GetConformer()
+            atoms = [mol.GetAtomWithIdx(i) for i in range(mol.GetNumAtoms())]
+            with open(xyz_path, "w") as fh:
+                fh.write(f"{len(atoms)}\n")
+                fh.write(f"Converted from {Path(sdf_path).name}\n")
+                for atom in atoms:
+                    pos = conf.GetAtomPosition(atom.GetIdx())
+                    sym = atom.GetSymbol()
+                    fh.write(f"{sym:4s} {pos.x:14.8f} {pos.y:14.8f} {pos.z:14.8f}\n")
+            return
+
+    # Fallback: minimal SDF → XYZ parser (no RDKit)
+    coord_block, n_atoms = g16.sdf_to_xyz_block(sdf_path)
+    lines = coord_block.strip().split("\n")
+    with open(xyz_path, "w") as fh:
+        fh.write(f"{n_atoms}\n")
+        fh.write(f"Converted from {Path(sdf_path).name}\n")
+        for line in lines:
             parts = line.split()
             if len(parts) == 4:
                 elem, x, y, z = parts
-                coords.append(
-                    f"  {elem:<3} {float(x):>14.8f} {float(y):>14.8f} {float(z):>14.8f}"
+                fh.write(f"{elem:4s} {float(x):14.8f} {float(y):14.8f} {float(z):14.8f}\n")
+
+
+def _xyz_to_sdf(
+    xyz_path:     str,
+    sdf_path:     str,
+    template_sdf: Optional[str] = None,
+) -> bool:
+    """
+    Convert an XYZ file to SDF.
+
+    If RDKit is available and a template SDF is provided, the bond
+    topology from the template is preserved (only coordinates are
+    updated).  This avoids bond-order guessing, which is unreliable
+    for heteroatom-rich molecules.
+
+    Returns True on success, False on failure.
+    """
+    if RDKIT_AVAILABLE and template_sdf:
+        try:
+            template = Chem.MolFromMolFile(template_sdf, removeHs=False, sanitize=False)
+            if template is None:
+                raise ValueError("Template could not be parsed by RDKit")
+
+            # Read XYZ coordinates
+            new_coords = []
+            with open(xyz_path) as fh:
+                lines = fh.readlines()
+            n_atoms = int(lines[0].strip())
+            for line in lines[2 : 2 + n_atoms]:
+                parts = line.split()
+                new_coords.append((float(parts[1]), float(parts[2]), float(parts[3])))
+
+            if len(new_coords) != template.GetNumAtoms():
+                raise ValueError(
+                    f"Atom count mismatch: XYZ={len(new_coords)}, "
+                    f"template={template.GetNumAtoms()}"
                 )
-    return "\n".join(coords)
+
+            # Overwrite the conformer coordinates
+            from rdkit.Chem import AllChem
+            mol = Chem.RWMol(template)
+            conf = mol.GetConformer()
+            from rdkit.Geometry import rdGeometry
+            for i, (x, y, z) in enumerate(new_coords):
+                conf.SetAtomPosition(i, (x, y, z))
+
+            writer = Chem.SDWriter(sdf_path)
+            writer.write(mol)
+            writer.close()
+            return True
+
+        except Exception as e:
+            print(f"  [conv] RDKit xyz→sdf failed ({e}); "
+                  f"falling back to plain-text SDF.")
+
+    # Fallback: write a minimal V2000 SDF with no bond table.
+    # Gaussian reads coordinates directly, so a bond-table-free SDF is
+    # acceptable as pipeline input (sdf_to_xyz_block only needs coords).
+    try:
+        with open(xyz_path) as fh:
+            lines = fh.readlines()
+        n_atoms = int(lines[0].strip())
+        atom_lines = lines[2 : 2 + n_atoms]
+
+        with open(sdf_path, "w") as fh:
+            fh.write("\n  CREST\n\n")
+            fh.write(f"{n_atoms:3d}  0  0  0  0  0  0  0  0  0999 V2000\n")
+            for line in atom_lines:
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                sym, x, y, z = parts[0], float(parts[1]), float(parts[2]), float(parts[3])
+                fh.write(f"{x:10.4f}{y:10.4f}{z:10.4f} {sym:<3s} 0  0  0  0  0  0  0  0  0  0  0  0\n")
+            fh.write("M  END\n$$$$\n")
+        return True
+    except Exception as e:
+        print(f"  [conv] Fallback xyz→sdf also failed: {e}")
+        return False
+
+
+def _xyz_block_to_sdf(xyz_block: str, sdf_path: str, template_sdf: Optional[str] = None) -> bool:
+    """Write an xyz_block string to a temp file, then convert to SDF."""
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".xyz", delete=False
+    ) as tmp:
+        tmp.write(xyz_block)
+        tmp_path = tmp.name
+    try:
+        return _xyz_to_sdf(tmp_path, sdf_path, template_sdf=template_sdf)
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Build Gaussian 16 input (.gjf)
+# Semi-empirical pre-optimisation inside Gaussian (PM7 or xTB-external)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def build_gjf(
-    coord_block:    str,
-    chk_path:       str,
+def build_gjf_preopt_pm7(
+    coord_block:  str,
+    chk_path:     str,
     *,
-    basis_set:      str           = "6-311G*",
-    charge:         int           = 0,
-    multiplicity:   int           = 1,
-    method:         str           = "PBE0",
-    operation:      str           = "opt freq",
-    nproc:          int           = 10,
-    mem:            str           = "28GB",
-    title:          str           = "Gaussian 16 DFT Calculation",
-    extra_keywords: str           = "NoTestMO SCF=(XQC,MaxCycle=200)",
-    cosmo:          bool          = False,
-    # ── Scratch / disk controls (the fix) ────────────────────────────────────
-    scratch_dir:    Optional[str] = None,   # if set, explicit %RWF path
-    cid:            str           = "mol",  # used to name the .rwf file
-    max_disk:       Optional[str] = None,   # e.g. "60GB" → MaxDisk=60GB keyword
+    charge:       int           = 0,
+    multiplicity: int           = 1,
+    nproc:        int           = 10,
+    mem:          str           = "28GB",
+    scratch_dir:  Optional[str] = None,
+    cid:          str           = "mol",
 ) -> str:
     """
-    Generate a Gaussian 16 .gjf input string.
+    Build a Gaussian .gjf for PM7 semi-empirical geometry optimisation.
 
-    Scratch strategy
-    ----------------
-    %NoSave is ALWAYS written.  This tells Gaussian to delete the .rwf
-    scratch file on normal termination, which is the single most important
-    fix for runaway disk usage.
+    Route line:  #p PM7 opt=(MaxCycles=500) NoTestMO
 
-    If scratch_dir is provided we also write an explicit %RWF line so that
-    the scratch file goes to a known location (useful if $GAUSS_SCRDIR isn't
-    set, or if you want per-job files on a fast NVMe vs your home dir).
+    PM7 (Stewart 2013) is a reparametrised semi-empirical Hamiltonian
+    built into Gaussian 16.  No external binary is needed.  It is a good
+    general-purpose method for organic/drug-like molecules and is fast
+    enough that even a 50-atom molecule converges in seconds.
 
-    MaxDisk gives Gaussian a hard cap; it will abort cleanly rather than
-    filling the disk.  Strongly recommended for WSL where OOM kills leave
-    partial .rwf files that never get cleaned up.
-
-    extra_keywords:
-        Default is "NoTestMO SCF=(XQC,MaxCycle=200)" to avoid crashes from
-        large MO coefficients (linear dependence) and improve SCF convergence.
+    The .chk written here is read back by extract_preopt_geometry_from_log
+    (via formchk + the Standard orientation block) to obtain the optimised
+    coordinates.  A separate scratch .rwf is used and deleted after the run
+    (%NoSave) to avoid accumulating large files.
     """
-    solvent_kw  = " scrf=(cpcm,solvent=water)" if cosmo else ""
-    extra       = f" {extra_keywords.strip()}" if extra_keywords.strip() else ""
-    max_disk_kw = f" MaxDisk={max_disk}" if max_disk else ""
-
-    # Always delete .rwf on normal termination
     nosave_line = "%NoSave\n"
-
-    # Optional explicit .rwf location — useful when scratch_dir != $GAUSS_SCRDIR
-    rwf_line = ""
+    rwf_line    = ""
     if scratch_dir:
-        rwf_path = str(Path(scratch_dir) / f"{cid}.rwf")
+        rwf_path = str(Path(scratch_dir) / f"{cid}_pm7preopt.rwf")
         rwf_line = f"%RWF={rwf_path}\n"
 
-    gjf = (
+    return (
         f"%chk={chk_path}\n"
-        f"{rwf_line}"                    # empty string if not set
-        f"{nosave_line}"                 # ALWAYS present
+        f"{rwf_line}"
+        f"{nosave_line}"
         f"%nprocshared={nproc}\n"
         f"%mem={mem}\n"
-        f"#p {method}/{basis_set} {operation}{solvent_kw}{extra}{max_disk_kw}\n"
+        f"#p PM7 opt=(MaxCycles=500) NoTestMO\n"
         f"\n"
-        f"{title}\n"
+        f"PM7 pre-optimisation\n"
         f"\n"
         f"{charge} {multiplicity}\n"
         f"{coord_block}\n"
         f"\n"
     )
-    return gjf
 
 
-def sdf_to_gjf(
-    sdf_path:    str,
-    gjf_path:    str,
-    chk_path:    str,
-    **kwargs,
+def build_gjf_preopt_xtb_external(
+    coord_block:  str,
+    chk_path:     str,
+    *,
+    charge:       int           = 0,
+    multiplicity: int           = 1,
+    nproc:        int           = 10,
+    mem:          str           = "28GB",
+    scratch_dir:  Optional[str] = None,
+    cid:          str           = "mol",
+    xtb_exec:     str           = "xtb",
+    solvent:      Optional[str] = None,
 ) -> str:
-    coord_block, _ = sdf_to_xyz_block(sdf_path)
-    gjf_content = build_gjf(coord_block, chk_path, **kwargs)
-    with open(gjf_path, "w") as fh:
-        fh.write(gjf_content)
-    return gjf_path
-
-
-def xyz_to_gjf(
-    xyz_file:  str,
-    gjf_path:  str,
-    chk_path:  str,
-    **kwargs,
-) -> str:
-    coord_block = read_xyz_file(xyz_file)
-    gjf_content = build_gjf(coord_block, chk_path, **kwargs)
-    with open(gjf_path, "w") as fh:
-        fh.write(gjf_content)
-    return gjf_path
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Run Gaussian 16
-# ──────────────────────────────────────────────────────────────────────────────
-
-def run_gaussian(
-    gjf_path:    str,
-    log_path:    str,
-    g16_exec:    str           = "g16",
-    timeout:     Optional[int] = None,
-    scratch_dir: Optional[str] = None,
-) -> tuple[bool, str]:
     """
-    Run Gaussian 16 on gjf_path, writing output to log_path.
+    Build a Gaussian .gjf that drives xTB geometry optimisation via the
+    Gaussian 'external=' interface.
 
-    If scratch_dir is provided, $GAUSS_SCRDIR is set for this subprocess only
-    (does not affect other processes or the parent environment).
+    Route line:
+        #p external="<xtb_cmd>" opt=(MaxCycles=500,CalcFC) NoTestMO
+
+    How Gaussian external= works
+    ────────────────────────────
+    Gaussian calls the external program once per optimisation step.  It
+    passes a scratch file containing the current geometry and asks for
+    energy + gradient (and optionally Hessian).  The external program
+    writes those quantities back.  Gaussian then runs its own GEDIIS/RFO
+    optimiser using the returned data.
+
+    The xTB binary understands the Gaussian external protocol natively
+    since xTB ≥ 6.4.  The call signature Gaussian uses is:
+        xtb <layer> <input_file> <output_file> <msg_file> [<fchk_file> <matel_file>]
+
+    Required setup
+    ──────────────
+    • xTB ≥ 6.4 on PATH (or passed via --xtb).
+    • The xTB binary must be compiled with Gaussian-interface support
+      (all official binaries from Grimme group include this).
+    • The Gaussian scratch directory must be writable by both processes.
+
+    CalcFC is added so Gaussian computes a force-constant matrix at the
+    start; this gives a better initial Hessian and usually speeds up
+    convergence significantly for near-flat PES regions.
     """
-    env = os.environ.copy()
+    nosave_line = "%NoSave\n"
+    rwf_line    = ""
     if scratch_dir:
-        Path(scratch_dir).mkdir(parents=True, exist_ok=True)
-        env["GAUSS_SCRDIR"] = scratch_dir
+        rwf_path = str(Path(scratch_dir) / f"{cid}_xtbpreopt.rwf")
+        rwf_line = f"%RWF={rwf_path}\n"
 
-    cmd = [g16_exec, gjf_path, log_path]
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-        )
-        if result.returncode != 0:
-            return False, result.stderr.strip() or f"Exit code {result.returncode}"
-        return True, ""
-    except FileNotFoundError:
-        return False, f"Gaussian executable '{g16_exec}' not found in PATH"
-    except subprocess.TimeoutExpired:
-        return False, f"Gaussian timed out after {timeout}s"
-    except Exception as exc:
-        return False, str(exc)
+    # Build the external= command string
+    # --chrg and --uhf are passed via environment in xtb ≥ 6.4, but
+    # including them explicitly on the command line is more robust.
+    uhf     = multiplicity - 1
+    xtb_cmd = f"{xtb_exec} --chrg {charge} --uhf {uhf}"
+    if solvent:
+        xtb_cmd += f" --alpb {solvent}"
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Parse Gaussian 16 output (.log)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def get_final_scf_energy(log_path: str) -> Optional[float]:
-    energy = None
-    pattern = re.compile(r"SCF Done:\s+E\(\S+\)\s+=\s+([-\d.]+)")
-    with open(log_path) as fh:
-        for line in fh:
-            m = pattern.search(line)
-            if m:
-                energy = float(m.group(1))
-    return energy
+    return (
+        f"%chk={chk_path}\n"
+        f"{rwf_line}"
+        f"{nosave_line}"
+        f"%nprocshared={nproc}\n"
+        f"%mem={mem}\n"
+        f'#p external="{xtb_cmd}" opt=(MaxCycles=500,CalcFC) NoTestMO\n'
+        f"\n"
+        f"xTB external pre-optimisation\n"
+        f"\n"
+        f"{charge} {multiplicity}\n"
+        f"{coord_block}\n"
+        f"\n"
+    )
 
 
-def get_geometries(
-    log_path:       str,
-    output_xyz_file: str,
-    geometry_index: int = -1,
-) -> None:
-    with open(log_path) as fh:
-        content = fh.read()
+def _extract_geometry_from_log(log_path: str) -> Optional[str]:
+    """
+    Extract the last 'Standard orientation' Cartesian coordinate block
+    from a Gaussian log file and return it as a coord_block string
+    suitable for use in build_gjf / build_gjf_freq.
 
+    Returns None if no Standard orientation block is found (e.g. the job
+    crashed before printing any geometry).
+    """
+    # Matches the coordinate table that follows "Standard orientation:"
+    # Each data row has the form:
+    #   center_no  atomic_no  atom_type  x  y  z
     block_re = re.compile(
         r"Standard orientation:.*?-{20,}.*?-{20,}\n(.*?)-{20,}",
         re.DOTALL,
     )
     row_re = re.compile(
-        r"^\s+(\d+)\s+(\d+)\s+\d+\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)",
+        r"^\s+\d+\s+(\d+)\s+\d+\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)",
         re.MULTILINE,
     )
 
     _Z_TO_SYM = {
-        1:'H',2:'He',3:'Li',4:'Be',5:'B',6:'C',7:'N',8:'O',9:'F',10:'Ne',
-        11:'Na',12:'Mg',13:'Al',14:'Si',15:'P',16:'S',17:'Cl',18:'Ar',
-        19:'K',20:'Ca',21:'Sc',22:'Ti',23:'V',24:'Cr',25:'Mn',26:'Fe',
-        27:'Co',28:'Ni',29:'Cu',30:'Zn',31:'Ga',32:'Ge',33:'As',34:'Se',
-        35:'Br',36:'Kr',37:'Rb',38:'Sr',39:'Y',40:'Zr',41:'Nb',42:'Mo',
-        43:'Tc',44:'Ru',45:'Rh',46:'Pd',47:'Ag',48:'Cd',49:'In',50:'Sn',
-        51:'Sb',52:'Te',53:'I',54:'Xe',55:'Cs',56:'Ba',57:'La',72:'Hf',
-        73:'Ta',74:'W',75:'Re',76:'Os',77:'Ir',78:'Pt',79:'Au',80:'Hg',
-        81:'Tl',82:'Pb',83:'Bi',84:'Po',85:'At',86:'Rn',
+        1:'H',  2:'He', 3:'Li', 4:'Be', 5:'B',  6:'C',  7:'N',  8:'O',
+        9:'F',  10:'Ne',11:'Na',12:'Mg',13:'Al',14:'Si',15:'P', 16:'S',
+        17:'Cl',18:'Ar',19:'K', 20:'Ca',21:'Sc',22:'Ti',23:'V', 24:'Cr',
+        25:'Mn',26:'Fe',27:'Co',28:'Ni',29:'Cu',30:'Zn',31:'Ga',32:'Ge',
+        33:'As',34:'Se',35:'Br',36:'Kr',37:'Rb',38:'Sr',39:'Y', 40:'Zr',
+        41:'Nb',42:'Mo',43:'Tc',44:'Ru',45:'Rh',46:'Pd',47:'Ag',48:'Cd',
+        49:'In',50:'Sn',51:'Sb',52:'Te',53:'I', 54:'Xe',55:'Cs',56:'Ba',
+        57:'La',72:'Hf',73:'Ta',74:'W', 75:'Re',76:'Os',77:'Ir',78:'Pt',
+        79:'Au',80:'Hg',81:'Tl',82:'Pb',83:'Bi',84:'Po',85:'At',86:'Rn',
     }
 
-    geometries: list[list[dict]] = []
-    for block in block_re.finditer(content):
-        rows = row_re.findall(block.group(1))
-        geom = []
-        for row in rows:
-            center_no, atomic_no, x, y, z = row
-            sym = _Z_TO_SYM.get(int(atomic_no), f"X{atomic_no}")
-            geom.append({"Atom_No": int(center_no), "Atom_Tag": sym,
-                         "X": float(x), "Y": float(y), "Z": float(z)})
-        if geom:
-            geometries.append(geom)
-
-    if not geometries:
-        print("No Standard orientation blocks found in Gaussian log.")
-        return
-
-    if geometry_index < -len(geometries) or geometry_index >= len(geometries):
-        print(f"Invalid geometry_index {geometry_index} (have {len(geometries)} geometries).")
-        return
-
-    geom = geometries[geometry_index]
-    with open(output_xyz_file, "w") as fh:
-        fh.write(f"{len(geom)}\n")
-        fh.write("Extracted from Gaussian 16 log\n")
-        for atom in geom:
-            fh.write(f"{atom['Atom_Tag']} {atom['X']} {atom['Y']} {atom['Z']}\n")
-
-
-def log_to_xyz(log_path: str, geometry_index: int = -1) -> str:
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xyz")
-    get_geometries(log_path, tmp.name, geometry_index=geometry_index)
-    return tmp.name
-
-
-def get_thermo_data(log_path: str, *, thermo_data: Optional[ThermoData] = None) -> ThermoData:
-    if thermo_data is None:
-        thermo_data = ThermoData()
-
-    HARTREE_TO_KCAL = 627.509474
-    in_thermo_table = False
-    cv_row_seen     = False
-
-    with open(log_path) as fh:
-        for raw_line in fh:
-            line = raw_line.strip()
-            ll   = line.lower()
-
-            if ll.startswith("temperature") and "kelvin" in ll:
-                m = re.search(r"temperature\s+([\d.]+)\s+kelvin", ll)
-                if m:
-                    thermo_data.temp = float(m.group(1))
-
-            elif "scale factor for frequencies" in ll:
-                m = re.search(r"scale factor for frequencies\s+=\s+([\d.]+)", ll)
-                if m:
-                    thermo_data.freq_scale = float(m.group(1))
-
-            elif ll.startswith("zero-point correction="):
-                m = re.search(r"=\s+([-\d.]+)", line)
-                if m:
-                    thermo_data.zpe = float(m.group(1)) * HARTREE_TO_KCAL
-
-            elif ll.startswith("thermal correction to energy="):
-                m = re.search(r"=\s+([-\d.]+)", line)
-                if m:
-                    thermo_data.te = float(m.group(1)) * HARTREE_TO_KCAL
-
-            elif ll.startswith("thermal correction to enthalpy="):
-                m = re.search(r"=\s+([-\d.]+)", line)
-                if m:
-                    thermo_data.th = float(m.group(1)) * HARTREE_TO_KCAL
-
-            elif "e (thermal)" in ll and "cv" in ll:
-                in_thermo_table = True
-
-            elif in_thermo_table:
-                if ll.startswith("total"):
-                    parts = line.split()
-                    if len(parts) >= 4:
-                        try:
-                            thermo_data.cv = float(parts[2])
-                            thermo_data.ts = float(parts[3])
-                            cv_row_seen = True
-                        except ValueError:
-                            pass
-
-                elif ll.startswith("translational"):
-                    parts = line.split()
-                    if len(parts) >= 4:
-                        try:
-                            if not cv_row_seen:
-                                thermo_data.ts_trans = float(parts[3])
-                            else:
-                                thermo_data.cv_trans = float(parts[2])
-                        except ValueError:
-                            pass
-
-                elif ll.startswith("rotational"):
-                    parts = line.split()
-                    if len(parts) >= 4:
-                        try:
-                            if not cv_row_seen:
-                                thermo_data.ts_rot = float(parts[3])
-                            else:
-                                thermo_data.cv_rot = float(parts[2])
-                        except ValueError:
-                            pass
-
-                elif ll.startswith("vibrational"):
-                    parts = line.split()
-                    if len(parts) >= 4:
-                        try:
-                            if not cv_row_seen:
-                                thermo_data.ts_vib = float(parts[3])
-                            else:
-                                thermo_data.cv_vib = float(parts[2])
-                        except ValueError:
-                            pass
-
-                elif line == "":
-                    in_thermo_table = False
-
-    return thermo_data
-
-
-def get_opt_steps(log_path: str, step_index: int = -1) -> Optional[OptStep]:
-    steps: list[OptStep] = []
-    max_force = rms_force = max_disp = rms_disp = None
-    energy    = None
-    step_no   = 0
-
-    scf_re   = re.compile(r"SCF Done:\s+E\(\S+\)\s+=\s+([-\d.]+)")
-    force_re = re.compile(
-        r"(Maximum Force|RMS\s+Force|Maximum Displacement|RMS\s+Displacement)"
-        r"\s+([-\d.]+)"
-    )
-
-    with open(log_path) as fh:
-        for line in fh:
-            m = scf_re.search(line)
-            if m:
-                energy = float(m.group(1))
-
-            fm = force_re.search(line)
-            if fm:
-                label, val = fm.group(1).strip(), float(fm.group(2))
-                if "Maximum Force" in label:
-                    max_force = val
-                elif "RMS" in label and "Force" in label:
-                    rms_force = val
-                elif "Maximum Displacement" in label:
-                    max_disp = val
-                elif "RMS" in label and "Displacement" in label:
-                    rms_disp = val
-
-                if all(v is not None for v in [max_force, rms_force, max_disp, rms_disp, energy]):
-                    step_no += 1
-                    delta_e = energy - steps[-1].energy if steps else 0.0
-                    steps.append(OptStep(
-                        step=step_no, energy=energy, delta_e=delta_e,
-                        rms_force=rms_force, max_force=max_force,
-                        rms_disp=rms_disp, max_disp=max_disp,
-                    ))
-                    max_force = rms_force = max_disp = rms_disp = None
-
-    if not steps:
-        return None
-    if step_index < -len(steps) or step_index >= len(steps):
-        return None
-    return steps[step_index]
-
-
-def check_normal_termination(log_path: str) -> bool:
     try:
         with open(log_path) as fh:
-            tail = fh.read()[-4096:]
-        return "Normal termination" in tail
+            content = fh.read()
     except OSError:
-        return False
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Thermochemistry helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
-def compute_gibbs(energy_hartree: float, thermo: ThermoData) -> Optional[float]:
-    HARTREE_TO_KJMOL = 2625.5
-    KCAL_TO_KJ       = 4.184
-    CAL_TO_KJ        = 4.184 / 1000.0
-
-    if thermo.th is None or thermo.ts is None or thermo.temp is None:
         return None
 
-    H = energy_hartree * HARTREE_TO_KJMOL + thermo.th * KCAL_TO_KJ
-    S = thermo.ts * CAL_TO_KJ
-    return H - thermo.temp * S
+    last_block = None
+    for match in block_re.finditer(content):
+        rows = row_re.findall(match.group(1))
+        if not rows:
+            continue
+        lines = []
+        for atomic_no_str, x, y, z in rows:
+            sym = _Z_TO_SYM.get(int(atomic_no_str), f"X{atomic_no_str}")
+            lines.append(
+                f"  {sym:<3} {float(x):>14.8f} {float(y):>14.8f} {float(z):>14.8f}"
+            )
+        last_block = "\n".join(lines)
+
+    return last_block   # None if no blocks found
 
 
-def redox_potential(
-    g_red:     float,
-    g_ox:      float,
-    g_sol_red: float,
-    g_sol_ox:  float,
-) -> float:
-    g_total = g_red - g_ox + (g_sol_red - g_red) - (g_sol_ox - g_ox)
-    return -g_total / 96.5
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Single-compound runner
-# ──────────────────────────────────────────────────────────────────────────────
-
-def run_compound(
-    sdf_path:     str,
-    work_dir:     str,
+def gaussian_semiempirical_preopt(
+    input_sdf:    str,
+    preopt_dir:   Path,
+    conf_label:   str,
+    *,
+    method:       str           = "pm7",    # "pm7" or "xtb"
     g16_exec:     str           = "g16",
-    basis_set:    str           = "6-311G*",
-    method:       str           = "PBE0",
-    operation:    str           = "opt freq",
+    xtb_exec:     str           = "xtb",
     charge:       int           = 0,
     multiplicity: int           = 1,
-    nproc:        Optional[int] = None,
+    nproc:        int           = 10,
     mem:          str           = "28GB",
-    cosmo:        bool          = False,
-    timeout:      Optional[int] = None,
-    scratch_dir:  Optional[str] = None,
-    max_disk:     Optional[str] = None,
-) -> RunResult:
-    sdf_path = str(sdf_path)
+    scratch_dir:  str           = "/tmp",
+    solvent:      Optional[str] = None,
+    cid:          str           = "mol",
+) -> str:
+    """
+    Run a PM7 or xTB-external geometry optimisation inside Gaussian 16 and
+    return the path to an SDF containing the optimised geometry.
+
+    On any failure (Gaussian crash, no geometry found, conversion error)
+    the function logs a warning and returns `input_sdf` unchanged so the
+    DFT step always has something to work with.
+
+    Parameters
+    ──────────
+    input_sdf   : path to the conformer SDF coming out of CREST
+    preopt_dir  : directory to write .gjf / .chk / .log into
+    conf_label  : short label used in file names, e.g. "conf001"
+    method      : "pm7" or "xtb"
+    ...rest     : forwarded to the gjf builders / Gaussian runner
+
+    Directory layout (all inside preopt_dir)
+    ─────────────────────────────────────────
+    <conf_label>_preopt.gjf   input
+    <conf_label>_preopt.chk   checkpoint (deleted after geometry extraction)
+    <conf_label>_preopt.log   full Gaussian output — keep for inspection
+    <conf_label>_preopt.sdf   optimised geometry (returned on success)
+    """
+    preopt_dir.mkdir(parents=True, exist_ok=True)
+    method = method.lower().strip()
+
+    gjf_path = str(preopt_dir / f"{conf_label}_preopt.gjf")
+    chk_path = str(preopt_dir / f"{conf_label}_preopt.chk")
+    log_path = str(preopt_dir / f"{conf_label}_preopt.log")
+    out_sdf  = str(preopt_dir / f"{conf_label}_preopt.sdf")
+
+    tag = "pm7" if method == "pm7" else "xTB-ext"
+    print(f"    [preopt/{tag}] optimising {conf_label} …")
+
+    # ── Read input geometry ───────────────────────────────────────────────────
+    try:
+        coord_block, _ = g16.sdf_to_xyz_block(input_sdf)
+    except Exception as exc:
+        print(f"    [preopt] WARNING: could not read {input_sdf}: {exc}. "
+              f"Skipping preopt.")
+        return input_sdf
+
+    # ── Build .gjf ────────────────────────────────────────────────────────────
+    common_kwargs = dict(
+        charge=charge,
+        multiplicity=multiplicity,
+        nproc=nproc,
+        mem=mem,
+        scratch_dir=scratch_dir,
+        cid=f"{cid}_{conf_label}",
+    )
+
+    if method == "pm7":
+        gjf_content = build_gjf_preopt_pm7(coord_block, chk_path, **common_kwargs)
+    elif method == "xtb":
+        gjf_content = build_gjf_preopt_xtb_external(
+            coord_block, chk_path,
+            xtb_exec=xtb_exec,
+            solvent=solvent,
+            **common_kwargs,
+        )
+    else:
+        print(f"    [preopt] WARNING: unknown preopt method '{method}'. "
+              f"Supported: pm7, xtb. Skipping preopt.")
+        return input_sdf
+
+    with open(gjf_path, "w") as fh:
+        fh.write(gjf_content)
+
+    # ── Run Gaussian ──────────────────────────────────────────────────────────
+    ok, err = g16.run_gaussian(
+        gjf_path, log_path,
+        g16_exec=g16_exec,
+        scratch_dir=scratch_dir,
+    )
+
+    if not ok or not g16.check_normal_termination(log_path):
+        print(f"    [preopt] WARNING: Gaussian {tag} preopt did not terminate "
+              f"normally ({err or 'check log'}). Using CREST geometry.")
+        _cleanup_preopt_scratch(scratch_dir, cid, conf_label, method)
+        return input_sdf
+
+    # ── Extract optimised geometry from log ───────────────────────────────────
+    opt_coord_block = _extract_geometry_from_log(log_path)
+    if opt_coord_block is None:
+        print(f"    [preopt] WARNING: no geometry found in {log_path}. "
+              f"Using CREST geometry.")
+        _cleanup_preopt_scratch(scratch_dir, cid, conf_label, method)
+        return input_sdf
+
+    # ── Write optimised geometry to SDF ──────────────────────────────────────
+    # Build a minimal SDF from the extracted coord block.
+    # We use the fallback writer directly (no RDKit bond-order guessing
+    # needed — the DFT step only cares about coordinates).
+    xyz_lines = []
+    for line in opt_coord_block.strip().split("\n"):
+        parts = line.split()
+        if len(parts) == 4:
+            elem, x, y, z = parts
+            xyz_lines.append(
+                f"{elem:4s} {float(x):14.8f} {float(y):14.8f} {float(z):14.8f}"
+            )
+    n_atoms = len(xyz_lines)
+
+    # Write a temporary xyz and convert to SDF so _xyz_to_sdf can use the
+    # template_sdf bond topology if RDKit is available.
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".xyz", delete=False
+    ) as tmp_xyz:
+        tmp_xyz.write(f"{n_atoms}\nGaussian {tag} preopt\n")
+        for ln in xyz_lines:
+            tmp_xyz.write(ln + "\n")
+        tmp_xyz_path = tmp_xyz.name
+
+    try:
+        sdf_ok = _xyz_to_sdf(tmp_xyz_path, out_sdf, template_sdf=input_sdf)
+    finally:
+        Path(tmp_xyz_path).unlink(missing_ok=True)
+
+    if not sdf_ok:
+        print(f"    [preopt] WARNING: could not convert optimised geometry "
+              f"to SDF. Using CREST geometry.")
+        _cleanup_preopt_scratch(scratch_dir, cid, conf_label, method)
+        return input_sdf
+
+    # Clean up scratch; .chk no longer needed (geometry is in the SDF)
+    _cleanup_preopt_scratch(scratch_dir, cid, conf_label, method)
+    Path(chk_path).unlink(missing_ok=True)
+
+    print(f"    [preopt/{tag}] done → {Path(out_sdf).name}")
+    return out_sdf
+
+
+def _cleanup_preopt_scratch(
+    scratch_dir: str,
+    cid:         str,
+    conf_label:  str,
+    method:      str,
+) -> None:
+    """Remove the .rwf scratch file written by the semi-empirical preopt."""
+    suffix = "pm7preopt" if method == "pm7" else "xtbpreopt"
+    rwf = Path(scratch_dir) / f"{cid}_{conf_label}_{suffix}.rwf"
+    rwf.unlink(missing_ok=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Gaussian step — wraps the existing pipeline
+# ──────────────────────────────────────────────────────────────────────────────
+
+def run_gaussian_on_conformer(
+    conformer_sdf: str,
+    conf_dir:      Path,
+    conf_label:    str,
+    *,
+    g16_exec:      str,
+    basis_set:     str,
+    method:        str,
+    operation:     str,
+    charge:        int,
+    multiplicity:  int,
+    nproc:         int,
+    mem:           str,
+    cosmo:         bool,
+    timeout:       Optional[int],
+    scratch_dir:   str,
+    max_disk:      Optional[str],
+    extra_keywords: str,
+) -> g16.RunResult:
+    """
+    Submit a single conformer SDF to the Gaussian pipeline.
+
+    We create a per-conformer work subdirectory so each conformer gets its
+    own .gjf / .chk / .log files and scratch space.
+    """
+    return g16.run_compound(
+        sdf_path=conformer_sdf,
+        work_dir=str(conf_dir),
+        g16_exec=g16_exec,
+        basis_set=basis_set,
+        method=method,
+        operation=operation,
+        charge=charge,
+        multiplicity=multiplicity,
+        nproc=nproc,
+        mem=mem,
+        cosmo=cosmo,
+        timeout=timeout,
+        scratch_dir=scratch_dir,
+        max_disk=max_disk,
+        extra_keywords=extra_keywords,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Top-level pipeline
+# ──────────────────────────────────────────────────────────────────────────────
+
+def run_pipeline(
+    sdf_path:         str,
+    work_dir:         str,
+    *,
+    # Flexibility / CREST control
+    flex_threshold:   int           = 3,
+    force_crest:      bool          = False,
+    skip_crest:       bool          = False,
+    n_conformers:     int           = 5,
+    energy_window:    float         = 3.0,
+    crest_ewin:       float         = 6.0,
+    # External executables
+    xtb_exec:         str           = "xtb",
+    crest_exec:       str           = "crest",
+    g16_exec:         str           = "g16",
+    # Molecular properties
+    charge:           int           = 0,
+    multiplicity:     int           = 1,
+    solvent:          Optional[str] = None,
+    # Semi-empirical preopt (step 5)
+    preopt_method:    str           = "pm7",   # "pm7" or "xtb"
+    skip_preopt:      bool          = False,
+    # Gaussian DFT settings
+    basis_set:        str           = "6-311G*",
+    method:           str           = "PBE0",
+    operation:        str           = "opt freq",
+    nproc:            int           = 10,
+    mem:              str           = "28GB",
+    cosmo:            bool          = False,
+    timeout:          Optional[int] = None,
+    scratch_dir:      Optional[str] = None,
+    max_disk:         Optional[str] = None,
+    extra_keywords:   str           = "NoTestMO SCF=(XQC,MaxCycle=200)",
+) -> PipelineResult:
+
+    sdf_path = str(Path(sdf_path).resolve())
     cid      = Path(sdf_path).stem
     job_dir  = Path(work_dir) / cid
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    gjf_path = str(job_dir / f"{cid}.gjf")
-    chk_path = str(job_dir / f"{cid}.chk")
-    log_path = str(job_dir / f"{cid}.log")
+    resolved_scratch = g16.get_scratch_dir(scratch_dir)
 
-    effective_nproc = nproc if nproc is not None else os.cpu_count() or 4
-
-    # ── Pre-run: clear any leftover scratch from a previous crashed run ───────
-    resolved_scratch = get_scratch_dir(scratch_dir)
-    cleanup_scratch_for_cid(resolved_scratch, cid)
-
-    # ── Build .gjf ────────────────────────────────────────────────────────────
-    try:
-        sdf_to_gjf(
-            sdf_path, gjf_path, chk_path,
-            basis_set=basis_set, method=method, operation=operation,
-            charge=charge, multiplicity=multiplicity,
-            nproc=effective_nproc, mem=mem, cosmo=cosmo,
-            title=f"CID {cid}",
-            scratch_dir=resolved_scratch,
-            cid=cid,
-            max_disk=max_disk,
-        )
-    except Exception as exc:
-        return RunResult(
-            cid=cid, sdf_path=sdf_path, gjf_path=gjf_path,
-            log_path=log_path, success=False,
-            error_msg=f"GJF build failed: {exc}",
-        )
-
-    # ── Run Gaussian ──────────────────────────────────────────────────────────
-    ok, err = run_gaussian(
-        gjf_path, log_path,
-        g16_exec=g16_exec,
-        timeout=timeout,
-        scratch_dir=resolved_scratch,
+    result = PipelineResult(
+        cid=cid,
+        sdf_path=sdf_path,
+        flexible=False,
+        n_rot_bonds=0,
+        crest_ran=False,
+        n_conformers_found=0,
+        n_conformers_calc=0,
     )
 
-    # ── Post-run: if job failed/crashed, clean up any leftover scratch ────────
-    if not ok or not check_normal_termination(log_path):
-        cleanup_scratch_for_cid(resolved_scratch, cid)
-        return RunResult(
-            cid=cid, sdf_path=sdf_path, gjf_path=gjf_path,
-            log_path=log_path, success=False,
-            error_msg=err or "Abnormal termination",
-        )
+    # ── 1. Flexibility check ──────────────────────────────────────────────────
+    flexible, n_rot = is_flexible(sdf_path, flex_threshold)
+    result.flexible    = flexible
+    result.n_rot_bonds = n_rot
 
-    # %NoSave handles deletion on normal termination, but clean up anyway
-    cleanup_scratch_for_cid(resolved_scratch, cid)
+    do_crest = (flexible or force_crest) and not skip_crest
 
-    # ── Parse results ─────────────────────────────────────────────────────────
-    energy    = get_final_scf_energy(log_path)
-    thermo    = get_thermo_data(log_path) if "freq" in operation.lower() else None
-    opt_steps = []
-    if "opt" in operation.lower():
-        step = get_opt_steps(log_path, step_index=-1)
-        if step:
-            opt_steps.append(step)
-
-    return RunResult(
-        cid=cid, sdf_path=sdf_path, gjf_path=gjf_path,
-        log_path=log_path, success=True,
-        energy=energy, thermo=thermo, opt_steps=opt_steps,
-    )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Batch runner
-# ──────────────────────────────────────────────────────────────────────────────
-
-def batch_run(
-    sdf_dir:     str,
-    work_dir:    str,
-    jobs:        int           = 1,
-    resume:      bool          = True,
-    scratch_dir: Optional[str] = None,
-    checkpoint:  Optional[str] = None,   # accepted but unused (path derived from work_dir)
-    **kwargs,
-) -> list[RunResult]:
-
-    sdfs = sorted(Path(sdf_dir).glob("*.sdf"))
-    if not sdfs:
-        print(f"No SDF files found in {sdf_dir}")
-        return []
-
-    Path(work_dir).mkdir(parents=True, exist_ok=True)
-
-    resolved_scratch = get_scratch_dir(scratch_dir)
-    report_scratch_usage(resolved_scratch)
-
-    checkpoint = load_checkpoint(work_dir)
-
-    pending = []
-    for sdf in sdfs:
-        cid    = sdf.stem
-        status = checkpoint["jobs"].get(cid, {}).get("status")
-        if resume and status == "completed":
-            print(f"Skipping {cid} (already completed)")
-            continue
-        pending.append(sdf)
-
-    print(f"\nGaussian batch:"
-          f"\n  Total     : {len(sdfs)}"
-          f"\n  Done      : {len(sdfs) - len(pending)}"
-          f"\n  Remaining : {len(pending)}"
-          f"\n  Scratch   : {resolved_scratch}\n")
-
-    results: list[RunResult] = []
-
-    try:
-        for i, sdf in enumerate(pending, 1):
-            cid = sdf.stem
-            print(f"[{i}/{len(pending)}] {cid}", flush=True)
-            update_checkpoint(work_dir, cid, "running")
-
-            try:
-                result = run_compound(
-                    str(sdf), work_dir,
-                    scratch_dir=resolved_scratch,
-                    **kwargs,
-                )
-            except KeyboardInterrupt:
-                # Clean scratch before propagating
-                cleanup_scratch_for_cid(resolved_scratch, cid)
-                update_checkpoint(work_dir, cid, "interrupted")
-                raise
-            except Exception as exc:
-                cleanup_scratch_for_cid(resolved_scratch, cid)
-                result = RunResult(
-                    cid=cid, sdf_path=str(sdf),
-                    gjf_path="", log_path="",
-                    success=False, error_msg=str(exc),
-                )
-
-            if result is None:
-                result = RunResult(
-                    cid=cid, sdf_path=str(sdf),
-                    gjf_path="", log_path="",
-                    success=False, error_msg="run_compound returned None",
-                )
-
-            results.append(result)
-
-            if result.success:
-                update_checkpoint(work_dir, cid, "completed", {"energy": result.energy})
-            else:
-                update_checkpoint(work_dir, cid, "failed", {"error": result.error_msg})
-
-            _print_result(result)
-            report_scratch_usage(resolved_scratch)   # show scratch state after each job
-
-    except KeyboardInterrupt:
-        print("\n\nInterrupted. Checkpoint saved. Run again to resume.")
-
-    finally:
-        _write_summary(results, Path(work_dir) / "batch_summary.tsv")
-
-    return results
-
-
-def _print_result(r: RunResult) -> None:
-    if r.success:
-        e_str = f"{r.energy:.6f} Ha" if r.energy is not None else "n/a"
-        t_str = f"T={r.thermo.temp} K" if r.thermo and r.thermo.temp else ""
-        print(f"  ✓  E={e_str}  {t_str}")
+    if skip_crest:
+        print(f"[{cid}] Skipping CREST (--skip-crest).")
+    elif force_crest:
+        print(f"[{cid}] Forcing CREST (--force-crest). "
+              f"Rotatable bonds: {n_rot}.")
+    elif flexible:
+        print(f"[{cid}] Flexible molecule ({n_rot} rotatable bonds ≥ "
+              f"threshold {flex_threshold}). Running CREST.")
     else:
-        print(f"  ✗  {r.error_msg}")
+        print(f"[{cid}] Rigid molecule ({n_rot} rotatable bonds < "
+              f"threshold {flex_threshold}). Skipping CREST.")
+
+    # ── 2-4. CREST path ───────────────────────────────────────────────────────
+    if do_crest:
+        # 2. GFN2-xTB pre-optimisation
+        preopt_sdf = xtb_preopt(
+            sdf_path, job_dir,
+            xtb_exec=xtb_exec,
+            nproc=nproc,
+            charge=charge,
+            multiplicity=multiplicity,
+            solvent=solvent,
+        )
+        if preopt_sdf is None:
+            result.error_msg = "xTB pre-optimisation failed."
+            return result
+        crest_input = preopt_sdf
+
+        # 3. CREST conformational search
+        conformers_xyz = run_crest(
+            crest_input, job_dir,
+            crest_exec=crest_exec,
+            xtb_exec=xtb_exec,
+            nproc=nproc,
+            charge=charge,
+            multiplicity=multiplicity,
+            solvent=solvent,
+            energy_window=crest_ewin,
+        )
+        if conformers_xyz is None:
+            result.error_msg = "CREST conformational search failed."
+            return result
+        result.crest_ran = True
+
+        # 4. Select top N conformers within energy window
+        selected = parse_crest_ensemble(
+            conformers_xyz,
+            n_select=n_conformers,
+            energy_window=energy_window,
+        )
+        result.n_conformers_found = _count_conformers_in_xyz(conformers_xyz)
+
+        if not selected:
+            result.error_msg = (
+                "No conformers found within energy window after CREST."
+            )
+            return result
+
+        print(f"  [sel ] Selected {len(selected)} conformer(s) "
+              f"within {energy_window} kcal/mol of minimum.")
+
+        # Write each selected conformer as a separate SDF for Gaussian
+        conformer_sdfs: list[tuple[int, float, str]] = []  # (rank, rel_e, sdf_path)
+        for rank, rel_e, xyz_block in selected:
+            conf_sdf = job_dir / f"{cid}_conf{rank:03d}.sdf"
+            ok = _xyz_block_to_sdf(xyz_block, str(conf_sdf), template_sdf=sdf_path)
+            if not ok:
+                print(f"  [sel ] WARNING: could not write SDF for conformer {rank}; skipping.")
+                continue
+            conformer_sdfs.append((rank, rel_e, str(conf_sdf)))
+
+    else:
+        # No CREST — treat the input SDF as the single "conformer"
+        conformer_sdfs = [(1, 0.0, sdf_path)]
+        result.n_conformers_found = 1
+
+    # ── 5. Semi-empirical pre-optimisation ───────────────────────────────────
+    #
+    # Each conformer SDF is pre-optimised at a cheap level (PM7 or xTB-via-
+    # Gaussian-external) before the expensive DFT run.  This moves the
+    # geometry closer to the DFT minimum, reducing the number of DFT cycles
+    # needed and lowering the risk of converging to a saddle point.
+    #
+    # Failures degrade gracefully: if Gaussian crashes or produces no
+    # geometry, the CREST SDF is used unchanged and the DFT step runs anyway.
+    if skip_preopt:
+        print(f"  [preopt] Skipping semi-empirical preopt (--skip-preopt).")
+        preopt_sdfs = conformer_sdfs   # pass through unchanged
+    else:
+        tag = preopt_method.upper()
+        print(f"  [preopt] Running {tag} pre-optimisation on "
+              f"{len(conformer_sdfs)} conformer(s) …")
+        preopt_sdfs = []
+        for rank, rel_e, conf_sdf in conformer_sdfs:
+            conf_label  = f"conf{rank:03d}"
+            preopt_dir  = job_dir / "preopt" / conf_label
+            optimised_sdf = gaussian_semiempirical_preopt(
+                conf_sdf, preopt_dir, conf_label,
+                method=preopt_method,
+                g16_exec=g16_exec,
+                xtb_exec=xtb_exec,
+                charge=charge,
+                multiplicity=multiplicity,
+                nproc=nproc,
+                mem=mem,
+                scratch_dir=resolved_scratch,
+                solvent=solvent,
+                cid=cid,
+            )
+            preopt_sdfs.append((rank, rel_e, optimised_sdf))
+
+    # ── 6. Gaussian DFT opt+freq on each pre-optimised conformer ─────────────
+    result.n_conformers_calc = len(preopt_sdfs)
+    conf_results: list[ConformerResult] = []
+
+    for i, (rank, rel_e, conf_sdf) in enumerate(preopt_sdfs, start=1):
+        label = f"conf{rank:03d}"
+        conf_dir = job_dir / "gaussian" / label
+        conf_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"\n  [{i}/{len(preopt_sdfs)}] Gaussian DFT on conformer {rank} "
+              f"(ΔE_CREST = {rel_e:+.2f} kcal/mol) …")
+
+        g16_result = run_gaussian_on_conformer(
+            conf_sdf, conf_dir, label,
+            g16_exec=g16_exec,
+            basis_set=basis_set,
+            method=method,
+            operation=operation,
+            charge=charge,
+            multiplicity=multiplicity,
+            nproc=nproc,
+            mem=mem,
+            cosmo=cosmo,
+            timeout=timeout,
+            scratch_dir=resolved_scratch,
+            max_disk=max_disk,
+            extra_keywords=extra_keywords,
+        )
+
+        # Extract energy — prefer freq log (has final SCF after opt converged)
+        dft_e = g16_result.energy
+
+        conf_r = ConformerResult(
+            rank=rank,
+            crest_energy=rel_e if do_crest else None,
+            gjf_path=g16_result.gjf_path,
+            log_path=g16_result.log_path,
+            success=g16_result.success,
+            dft_energy=dft_e,
+            thermo=g16_result.thermo,
+            error_msg=g16_result.error_msg,
+        )
+        conf_results.append(conf_r)
+
+        if g16_result.success:
+            e_str = f"{dft_e:.6f} Ha" if dft_e is not None else "n/a"
+            print(f"  ✓  conformer {rank}: E(DFT) = {e_str}")
+        else:
+            print(f"  ✗  conformer {rank}: {g16_result.error_msg}")
+
+    result.conformers = conf_results
+
+    # ── 7. Find the DFT global minimum ───────────────────────────────────────
+    successful = [c for c in conf_results if c.success and c.dft_energy is not None]
+    if successful:
+        result.best_conformer = min(successful, key=lambda c: c.dft_energy)
+        result.success = True
+        print(f"\n  ★  DFT global minimum: conformer {result.best_conformer.rank} "
+              f"(E = {result.best_conformer.dft_energy:.6f} Ha)")
+    else:
+        result.error_msg = "All Gaussian calculations failed."
+
+    return result
 
 
-def _write_summary(results: list[RunResult], path: Path) -> None:
-    import csv
-    fields = ["cid", "success", "energy_ha", "temp_K", "zpe_kcal",
-              "th_kcal", "ts_cal_K", "error_msg"]
-    with open(path, "w", newline="") as fh:
+# ──────────────────────────────────────────────────────────────────────────────
+# Output / reporting
+# ──────────────────────────────────────────────────────────────────────────────
+
+HARTREE_TO_KCAL = 627.509474
+
+
+def write_summary(result: PipelineResult, out_dir: Path) -> Path:
+    """
+    Write a TSV summary of all conformer DFT results, ranked by DFT energy.
+    Returns the path to the summary file.
+    """
+    tsv_path = out_dir / f"{result.cid}_conformer_summary.tsv"
+
+    # Sort successful conformers by DFT energy; failed ones go at the end
+    successful = sorted(
+        [c for c in result.conformers if c.success and c.dft_energy is not None],
+        key=lambda c: c.dft_energy,
+    )
+    failed = [c for c in result.conformers if not c.success or c.dft_energy is None]
+    ordered = successful + failed
+
+    # Compute relative DFT energies
+    e_min = successful[0].dft_energy if successful else None
+
+    fields = [
+        "dft_rank", "crest_rank", "dft_energy_Ha",
+        "dft_rel_energy_kcal", "crest_rel_energy_kcal",
+        "zpe_kcal", "thermal_H_kcal", "TS_cal_K",
+        "temp_K", "success", "log_path", "error_msg",
+    ]
+
+    with open(tsv_path, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=fields, delimiter="\t")
         w.writeheader()
-        for r in results:
-            if r is None:
-                continue
-            w.writerow({
-                "cid":       r.cid,
-                "success":   r.success,
-                "energy_ha": r.energy if r.energy is not None else "",
-                "temp_K":    r.thermo.temp if r.thermo else "",
-                "zpe_kcal":  r.thermo.zpe  if r.thermo else "",
-                "th_kcal":   r.thermo.th   if r.thermo else "",
-                "ts_cal_K":  r.thermo.ts   if r.thermo else "",
-                "error_msg": r.error_msg,
-            })
-    print(f"Summary written to {path}")
+        for dft_rank, conf in enumerate(ordered, start=1):
+            rel_dft = (
+                (conf.dft_energy - e_min) * HARTREE_TO_KCAL
+                if (conf.dft_energy is not None and e_min is not None)
+                else ""
+            )
+            row = {
+                "dft_rank":               dft_rank,
+                "crest_rank":             conf.rank,
+                "dft_energy_Ha":          conf.dft_energy if conf.dft_energy is not None else "",
+                "dft_rel_energy_kcal":    f"{rel_dft:.4f}" if rel_dft != "" else "",
+                "crest_rel_energy_kcal":  f"{conf.crest_energy:.4f}" if conf.crest_energy is not None else "",
+                "zpe_kcal":               conf.thermo.zpe if conf.thermo else "",
+                "thermal_H_kcal":         conf.thermo.th  if conf.thermo else "",
+                "TS_cal_K":               conf.thermo.ts  if conf.thermo else "",
+                "temp_K":                 conf.thermo.temp if conf.thermo else "",
+                "success":                conf.success,
+                "log_path":               conf.log_path,
+                "error_msg":              conf.error_msg,
+            }
+            w.writerow(row)
+
+    print(f"\n[summary] Written to {tsv_path}")
+    return tsv_path
+
+
+def print_result(result: PipelineResult) -> None:
+    print(f"\n{'═'*60}")
+    print(f"  CID         : {result.cid}")
+    print(f"  Flexible    : {result.flexible} ({result.n_rot_bonds} rot. bonds)")
+    print(f"  CREST ran   : {result.crest_ran}")
+    if result.crest_ran:
+        print(f"  Conformers  : {result.n_conformers_found} found, "
+              f"{result.n_conformers_calc} submitted to Gaussian")
+    print(f"  Success     : {result.success}")
+    if not result.success:
+        print(f"  Error       : {result.error_msg}")
+    if result.best_conformer:
+        bc = result.best_conformer
+        print(f"  Best conf.  : rank {bc.rank}, "
+              f"E = {bc.dft_energy:.6f} Ha")
+        if bc.thermo:
+            print(f"  Thermo (best conformer):")
+            print(f"    T        = {bc.thermo.temp} K")
+            print(f"    ZPE      = {bc.thermo.zpe} kcal/mol")
+            print(f"    H corr   = {bc.thermo.th} kcal/mol")
+            print(f"    TS       = {bc.thermo.ts} cal/mol·K")
+    print(f"{'═'*60}\n")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -885,111 +1289,162 @@ def _write_summary(results: list[RunResult], path: Path) -> None:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        description="Gaussian 16 local pipeline (SDF → .gjf → g16 → parse)"
+        description=(
+            "CREST conformational search + Gaussian 16 DFT pipeline.\n"
+            "Flexible molecules are pre-screened with xTB/CREST before DFT."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    src = parser.add_mutually_exclusive_group(required=True)
-    src.add_argument("--sdf",      help="Single SDF file")
-    src.add_argument("--sdf-dir", help="Directory of SDF files (batch mode)")
+    # ── Input / output ────────────────────────────────────────────────────────
+    parser.add_argument("--sdf",     required=True, help="Input SDF file")
+    parser.add_argument("--workdir", default="./crest_g16_runs",
+                        help="Output directory (default: ./crest_g16_runs)")
 
-    parser.add_argument("--workdir",   default="./g16_runs", help="Working / output directory")
-    parser.add_argument("--g16",       default="g16",        help="Gaussian 16 executable")
-    parser.add_argument("--basis",     default="6-311G*",    help="Basis set")
-    parser.add_argument("--method",    default="PBE0",       help="DFT functional")
-    parser.add_argument("--operation", default="opt freq",   help="Gaussian task keywords")
-    parser.add_argument("--charge",    default=0,  type=int, help="Molecular charge")
-    parser.add_argument("--mult",      default=1,  type=int, help="Spin multiplicity")
-    parser.add_argument("--nproc",     default=10, type=int, help="%nprocshared")
-    parser.add_argument("--mem",       default="28GB",       help="%mem")
-    parser.add_argument("--cosmo",     action="store_true",  help="SCRF=(CPCM,Solvent=Water)")
-    parser.add_argument("--jobs",      default=1,  type=int, help="Parallel workers (batch)")
-    parser.add_argument("--timeout",   default=None, type=int, help="Per-job timeout (seconds)")
-
-    # ── Scratch controls ──────────────────────────────────────────────────────
+    # ── Flexibility / CREST ───────────────────────────────────────────────────
     parser.add_argument(
-        "--scratch",
-        default=None,
+        "--flex-threshold", type=int, default=3, metavar="N",
+        help="Min rotatable bonds to consider a molecule flexible "
+             "and trigger CREST (default: 3)",
+    )
+    parser.add_argument(
+        "--force-crest", action="store_true",
+        help="Run CREST even for rigid molecules",
+    )
+    parser.add_argument(
+        "--skip-crest", action="store_true",
+        help="Skip CREST entirely; run Gaussian on the input SDF only",
+    )
+    parser.add_argument(
+        "--n-conformers", type=int, default=5, metavar="N",
+        help="Max conformers to submit to Gaussian (default: 5)",
+    )
+    parser.add_argument(
+        "--energy-window", type=float, default=3.0, metavar="KCAL",
+        help="Max CREST relative energy (kcal/mol) for conformer selection "
+             "(default: 3.0)",
+    )
+    parser.add_argument(
+        "--crest-ewin", type=float, default=6.0, metavar="KCAL",
+        help="CREST --ewin value: ensemble energy window for the search "
+             "(default: 6.0; larger = more conformers found)",
+    )
+    parser.add_argument(
+        "--solvent", default=None, metavar="SOLVENT",
+        help="Implicit solvent for xTB/CREST via ALPB (e.g. water, acetonitrile). "
+             "Also enables SCRF=(CPCM,...) in Gaussian if --cosmo is set.",
+    )
+
+    # ── External executables ──────────────────────────────────────────────────
+    parser.add_argument("--xtb",   default="xtb",   help="Path to xtb binary")
+    parser.add_argument("--crest", default="crest", help="Path to crest binary")
+    parser.add_argument("--g16",   default="g16",   help="Path to g16 binary")
+
+    # ── Molecular charge / multiplicity ───────────────────────────────────────
+    parser.add_argument("--charge", type=int, default=0,
+                        help="Molecular charge (default: 0)")
+    parser.add_argument("--mult",   type=int, default=1,
+                        help="Spin multiplicity (default: 1)")
+
+    # ── Semi-empirical preopt ─────────────────────────────────────────────────
+    parser.add_argument(
+        "--preopt-method",
+        default="pm7",
+        choices=["pm7", "xtb"],
+        dest="preopt_method",
         help=(
-            "Scratch directory for Gaussian .rwf files. "
-            "Overrides $GAUSS_SCRDIR. "
-            "Files are deleted after each job (%NoSave + explicit cleanup). "
-            "Example: --scratch /fast/nvme/g16scratch"
+            "Semi-empirical method for Gaussian pre-optimisation before DFT. "
+            "'pm7' (default): uses Gaussian's built-in PM7 Hamiltonian — "
+            "no extra binary needed, good for organic/drug-like molecules. "
+            "'xtb': drives GFN2-xTB via Gaussian's external= interface — "
+            "requires xTB on PATH, more accurate for heavy atoms and "
+            "non-covalent interactions."
         ),
     )
     parser.add_argument(
-        "--max-disk",
-        default=None,
-        dest="max_disk",
-        help=(
-            "Hard disk cap passed as MaxDisk=X to Gaussian. "
-            "Gaussian aborts cleanly instead of filling the disk. "
-            "Example: --max-disk 60GB"
-        ),
-    )
-    parser.add_argument(
-        "--clean-scratch",
+        "--skip-preopt",
         action="store_true",
-        dest="clean_scratch",
+        dest="skip_preopt",
         help=(
-            "Wipe ALL Gaussian scratch files from the scratch directory "
-            "before starting. Use after a crash left orphaned .rwf files."
+            "Skip the semi-empirical pre-optimisation step entirely. "
+            "Conformers from CREST are passed directly to DFT."
         ),
     )
+
+    # ── Gaussian DFT settings ─────────────────────────────────────────────────
+    parser.add_argument("--method",    default="PBE0",
+                        help="DFT functional (default: PBE0)")
+    parser.add_argument("--basis",     default="6-311G*",
+                        help="Basis set (default: 6-311G*)")
+    parser.add_argument("--operation", default="opt freq",
+                        help="Gaussian task keywords (default: 'opt freq')")
+    parser.add_argument("--nproc",     type=int, default=10,
+                        help="%%nprocshared (default: 10)")
+    parser.add_argument("--mem",       default="28GB",
+                        help="%%mem (default: 28GB)")
+    parser.add_argument("--cosmo",     action="store_true",
+                        help="Add SCRF=(CPCM,Solvent=water) to Gaussian route")
+    parser.add_argument("--timeout",   type=int, default=None,
+                        help="Per-conformer Gaussian timeout in seconds")
+    parser.add_argument("--scratch",   default=None,
+                        help="Gaussian scratch directory (overrides $GAUSS_SCRDIR)")
+    parser.add_argument("--max-disk",  default=None, dest="max_disk",
+                        help="Gaussian MaxDisk cap (e.g. 200GB)")
     parser.add_argument(
-        "--extra_keywords",
+        "--extra-keywords",
         default="NoTestMO SCF=(XQC,MaxCycle=200)",
-        help=(
-            "Extra keywords for Gaussian route line. "
-            "Default: NoTestMO SCF=(XQC,MaxCycle=200) "
-            "(avoids MO coefficient crash and improves SCF convergence). "
-            "Example: --extra_keywords 'NoTestMO Int=UltraFine'"
-        ),
+        dest="extra_keywords",
+        help="Extra Gaussian route keywords (default: 'NoTestMO SCF=(XQC,MaxCycle=200)')",
     )
 
     args = parser.parse_args(argv)
 
-    resolved_scratch = get_scratch_dir(args.scratch)
+    if not Path(args.sdf).exists():
+        sys.exit(f"ERROR: SDF file not found: {args.sdf}")
 
-    if args.clean_scratch:
-        print(f"Cleaning scratch directory: {resolved_scratch}")
-        cleanup_all_scratch(resolved_scratch)
+    if not RDKIT_AVAILABLE:
+        print(
+            "WARNING: RDKit is not installed. Rotatable-bond counting is "
+            "unavailable; all molecules will be treated as rigid unless "
+            "--force-crest is set.\n"
+            "Install RDKit:  conda install -c conda-forge rdkit"
+        )
 
-    report_scratch_usage(resolved_scratch)
-
-    kwargs = dict(
+    result = run_pipeline(
+        sdf_path=args.sdf,
+        work_dir=args.workdir,
+        flex_threshold=args.flex_threshold,
+        force_crest=args.force_crest,
+        skip_crest=args.skip_crest,
+        n_conformers=args.n_conformers,
+        energy_window=args.energy_window,
+        crest_ewin=args.crest_ewin,
+        xtb_exec=args.xtb,
+        crest_exec=args.crest,
         g16_exec=args.g16,
+        charge=args.charge,
+        multiplicity=args.mult,
+        solvent=args.solvent,
+        preopt_method=args.preopt_method,
+        skip_preopt=args.skip_preopt,
         basis_set=args.basis,
         method=args.method,
         operation=args.operation,
-        charge=args.charge,
-        multiplicity=args.mult,
         nproc=args.nproc,
         mem=args.mem,
         cosmo=args.cosmo,
         timeout=args.timeout,
-        scratch_dir=resolved_scratch,
+        scratch_dir=g16.get_scratch_dir(args.scratch),
         max_disk=args.max_disk,
         extra_keywords=args.extra_keywords,
     )
 
-    if args.sdf:
-        r = run_compound(args.sdf, args.workdir, **kwargs)
-        _print_result(r)
-        if r.thermo:
-            print(f"\nThermochemistry (CID {r.cid}):")
-            for f in dataclasses.fields(r.thermo):
-                v = getattr(r.thermo, f.name)
-                if v is not None:
-                    print(f"  {f.name:12s} = {v}")
-        return 0 if r.success else 1
+    print_result(result)
 
-    else:
-        results = batch_run(
-            args.sdf_dir, args.workdir,
-            jobs=args.jobs,
-            **kwargs,
-        )
-        return 0 if all(r.success for r in results) else 1
+    out_dir = Path(args.workdir) / result.cid
+    write_summary(result, out_dir)
+
+    return 0 if result.success else 1
 
 
 if __name__ == "__main__":

@@ -17,11 +17,11 @@ import time
 from typing import Dict, List
 from urllib.parse import quote_plus
 
-
-import requests
 from bs4 import BeautifulSoup
 
-PUBCHEM_PUG_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
+from ivette.util import http
+
+PUBCHEM_PUG_BASE = http.PUBCHEM_PUG
 CHEMBL_BASE = "https://www.ebi.ac.uk/chembl/api/data"
 CACHE_FILENAME = os.path.join(os.path.dirname(__file__), "chembl_target_name_cache.json")
 
@@ -103,11 +103,7 @@ def fetch_pubchem_bioassays(
 
     # Step 1: get AIDs
     try:
-        r = requests.get(
-            f"{PUBCHEM_PUG_BASE}/compound/cid/{cid}/aids/JSON", timeout=30
-        )
-        r.raise_for_status()
-        data = r.json()
+        data = http.get_json(f"{PUBCHEM_PUG_BASE}/compound/cid/{cid}/aids/JSON")
         aids = []
         for v in data.values():
             if isinstance(v, list):
@@ -127,9 +123,7 @@ def fetch_pubchem_bioassays(
     # Step 2: single CSV fetch per AID (replaces 3-call pattern)
     for aid in aids:
         try:
-            r = requests.get(
-                f"{PUBCHEM_PUG_BASE}/assay/aid/{aid}/CSV", timeout=30
-            )
+            r = http.get(f"{PUBCHEM_PUG_BASE}/assay/aid/{aid}/CSV")
             if r.status_code != 200 or not r.text.strip():
                 out.append({
                     "Source": "PubChem", "AssayID": aid, "AssayTitle": "",
@@ -195,11 +189,7 @@ def _batch_resolve_target_names(
     dirty = False
     for target_id in missing:
         try:
-            r = requests.get(
-                f"{CHEMBL_BASE}/target/{target_id}.json", timeout=15
-            )
-            r.raise_for_status()
-            td = r.json()
+            td = http.get_json(f"{CHEMBL_BASE}/target/{target_id}.json", timeout=15)
             name = td.get("pref_name") or td.get("target_name") or ""
             if not name:
                 for comp in td.get("target_components", []):
@@ -235,16 +225,11 @@ def fetch_chembl_activities_by_inchikey(
     )
 
     try:
-        r = requests.get(
+        data = http.get_json(
             f"{CHEMBL_BASE}/molecule"
             f"?molecule_structures__standard_inchi_key={inchikey}"
-            f"&format=json",
-            timeout=30,
+            f"&format=json"
         )
-
-        r.raise_for_status()
-
-        data = r.json()
 
         results = (
             data.get("molecules")
@@ -279,7 +264,7 @@ def fetch_chembl_activities_by_inchikey(
 
         try:
 
-            r = requests.get(
+            data = http.get_json(
                 f"{CHEMBL_BASE}/activity"
                 f"?molecule_chembl_id={chembl_id}"
                 f"&limit={activity_limit}"
@@ -287,10 +272,6 @@ def fetch_chembl_activities_by_inchikey(
                 f"&format=json",
                 timeout=60,
             )
-
-            r.raise_for_status()
-
-            data = r.json()
 
             page = (
                 data.get("activities")
@@ -425,7 +406,7 @@ def fetch_bindingdb_activities_by_inchikey(inchikey: str) -> List[Dict]:
         page_text = None
         for url in candidates:
             try:
-                r = requests.get(url, timeout=30)
+                r = http.get(url)
                 if r.status_code == 200 and inchikey.lower() in r.text.lower():
                     page_text = r.text
                     break
@@ -447,7 +428,7 @@ def fetch_bindingdb_activities_by_inchikey(inchikey: str) -> List[Dict]:
 
         for url in detail_pages:
             try:
-                r = requests.get(url, timeout=30)
+                r = http.get(url)
                 if r.status_code != 200:
                     continue
                 for m in pattern.finditer(r.text):

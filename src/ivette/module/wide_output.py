@@ -1,20 +1,13 @@
 """Build wide-format CSV outputs and merge pharmacology data."""
 import csv
 import os
-import re
 import statistics
 
-
-NUMERIC_VALUE_RE = re.compile(r"[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?")
+from ivette.util.text import extract_numeric
 
 
 def extract_numeric_value(value) -> float | None:
-    text = str(value).strip() if value is not None else ""
-    match = NUMERIC_VALUE_RE.search(text)
-    try:
-        return float(match.group(0)) if match else None
-    except ValueError:
-        return None
+    return extract_numeric(value, coerce=True)
 
 
 def compute_iqr(values: list[float]) -> float:

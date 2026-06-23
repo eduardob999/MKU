@@ -27,8 +27,6 @@ Output:
 
 from itertools import combinations
 from datetime import datetime
-from pathlib import Path
-import json
 
 from rdkit import Chem
 

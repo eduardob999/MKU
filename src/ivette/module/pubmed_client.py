@@ -2,7 +2,9 @@
 import re
 import time
 import xml.etree.ElementTree as ET
-import requests
+
+from ivette.util import http
+from ivette.util.patterns import THERMO_REGEX
 
 ENTREZ_ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 ENTREZ_EFETCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
@@ -11,14 +13,6 @@ PUBMED_THERMO_TERMS = [
     "enthalpy", "entropy", "gibbs free energy", "free energy",
     "heat of formation", "heat of combustion",
 ]
-
-THERMO_REGEX = re.compile(
-    r"((?:ΔH|Delta H|enthalpy|ΔS|Delta S|entropy|ΔG|Delta G|Gibbs free energy|free energy"
-    r"|heat of formation|heat of combustion)[^\.\n]{0,120}?"
-    r"[-+]?\d+(?:\.\d+)?\s*(?:kJ/mol|kJ mol-1|J/mol|J mol-1|kcal/mol|kcal mol-1"
-    r"|cal/mol|cal mol-1|kcal per mol|kJ per mol))",
-    re.IGNORECASE,
-)
 
 
 def build_pubmed_query(name: str) -> str:
@@ -29,16 +23,14 @@ def build_pubmed_query(name: str) -> str:
 
 def pubmed_search(name: str, max_results: int = 10) -> tuple[int, list[str]]:
     params = {"db": "pubmed", "retmode": "json", "retmax": str(max_results), "term": build_pubmed_query(name)}
-    r = requests.get(ENTREZ_ESEARCH, params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json().get("esearchresult", {})
+    data = http.get_json(ENTREZ_ESEARCH, params=params).get("esearchresult", {})
     return int(data.get("count", "0")), data.get("idlist", [])
 
 
 def pubmed_fetch_abstracts(pmids: list[str]) -> list[dict]:
     if not pmids:
         return []
-    r = requests.get(ENTREZ_EFETCH, params={"db": "pubmed", "retmode": "xml", "id": ",".join(pmids)}, timeout=30)
+    r = http.get(ENTREZ_EFETCH, params={"db": "pubmed", "retmode": "xml", "id": ",".join(pmids)})
     r.raise_for_status()
     root = ET.fromstring(r.content)
     articles = []

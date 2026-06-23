@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
-"""
-download_physchem.py
+"""Download physicochemical properties from PubChem for compounds matching a
+given substructure (SMILES).
 
-Download physicochemical properties from PubChem for compounds matching
-a given substructure (SMILES).
-
-Usage examples:
-  python scripts/download_physchem.py --smiles "c1ccccc1" --max 200 --output benzene_matches.csv
-
-Notes:
-  - This tool queries PubChem PUG-REST. It returns CIDs for the substructure
-    search and then fetches the requested properties in batches.
-  - It is intentionally lightweight and depends only on `requests` and `pandas`.
+Queries PubChem PUG-REST: resolves CIDs for the substructure search, then
+fetches the requested properties in batches.
 """
 import argparse
-import time
-import requests
-import sys
-from urllib.parse import quote
 import csv
+import sys
+import time
+from urllib.parse import quote
+
+import requests
 from rdkit import Chem
 
+from ivette.util import http
+from ivette.util.prompts import ask, ask_yn
+from ivette.util.text import chunked
+
+PUBCHEM_BASE = http.PUBCHEM_PUG
+
 NITRO_ZWITTER_SMARTS = Chem.MolFromSmarts("[c,C][N+](=O)[O-]")  # nitro on any carbon
+
 
 def is_nitro_zwitterion(smiles: str) -> bool:
     """True if molecule contains at least one nitro group and has zero net charge."""
@@ -34,8 +34,6 @@ def is_nitro_zwitterion(smiles: str) -> bool:
     if net_charge != 0:             # exclude anything with residual charge
         return False
     return mol.HasSubstructMatch(NITRO_ZWITTER_SMARTS)
-
-PUBCHEM_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
 
 DEFAULT_PROPERTIES = [
     "MolecularWeight",
@@ -122,55 +120,8 @@ def get_cids_for_substructure(smiles, max_records=1000, max_retries=5, use_smart
 
 
 def fetch_properties_for_cids(cids, properties, max_retries=5):
-    """Fetch properties for a list of CIDs. Returns list of dicts.
-    Retries on connection errors and 5xx responses with exponential backoff.
-    Splits and retries smaller batches on 400 errors.
-    """
-    if not cids:
-        return []
-
-    prop_str = ",".join(properties)
-    cid_str = ",".join(str(int(x)) for x in cids)
-    url = f"{PUBCHEM_BASE}/compound/cid/{cid_str}/property/{prop_str}/JSON"
-
-    resp = None
-    for attempt in range(max_retries):
-        try:
-            resp = requests.get(url, timeout=60)
-            resp.raise_for_status()
-            return resp.json().get("PropertyTable", {}).get("Properties", [])
-
-        except (requests.exceptions.ConnectionError,
-                requests.exceptions.ChunkedEncodingError) as e:
-            # Network-level failure (RemoteDisconnected, connection aborted, etc.)
-            wait = 2 ** attempt
-            print(f"  Connection error (attempt {attempt + 1}/{max_retries}), retrying in {wait}s: {e}",
-                  file=sys.stderr)
-            time.sleep(wait)
-
-        except requests.HTTPError:
-            if resp is not None and resp.status_code == 400 and len(cids) > 1:
-                # Bad request — split batch and retry halves
-                mid = len(cids) // 2
-                return (fetch_properties_for_cids(cids[:mid], properties, max_retries) +
-                        fetch_properties_for_cids(cids[mid:], properties, max_retries))
-            elif resp is not None and resp.status_code in (429, 500, 502, 503, 504):
-                # Rate limited or server error — back off and retry
-                wait = 2 ** attempt
-                print(f"  HTTP {resp.status_code} (attempt {attempt + 1}/{max_retries}), retrying in {wait}s",
-                      file=sys.stderr)
-                time.sleep(wait)
-            else:
-                raise
-
-    raise requests.exceptions.ConnectionError(
-        f"Failed to fetch properties after {max_retries} attempts for {len(cids)} CIDs"
-    )
-
-
-def chunked(iterable, size):
-    for i in range(0, len(iterable), size):
-        yield iterable[i:i + size]
+    """Fetch PubChem properties for a list of CIDs (see util.http for retry logic)."""
+    return http.pubchem_fetch_properties(cids, properties, max_retries=max_retries)
 
 
 def main(argv=None):
@@ -194,23 +145,6 @@ def main(argv=None):
     if not args.no_menu and sys.stdin.isatty():
         print("\n=== PubChem Physchem Downloader ===\n")
         print("Press Enter to accept the value shown in [brackets].\n")
-
-        def ask(prompt, default, cast=str):
-            while True:
-                raw = input(f"  {prompt} [{default}]: ").strip()
-                if raw == "":
-                    return cast(default)
-                try:
-                    return cast(raw)
-                except ValueError:
-                    print(f"    ! Expected {cast.__name__}, got: {raw!r}")
-
-        def ask_yn(prompt, default=True):
-            hint = "Y/n" if default else "y/N"
-            raw = input(f"  {prompt} [{hint}]: ").strip().lower()
-            if raw == "":
-                return default
-            return raw in ("y", "yes")
 
         # --- input source ---
         if not args.smiles and not args.input_file:

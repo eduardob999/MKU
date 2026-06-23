@@ -1,7 +1,6 @@
-"""Interactive menu and argument parsing."""
+"""Interactive menu and argument parsing for the thermo finder."""
 import sys
 import argparse
-import time as _time
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -209,19 +208,3 @@ def interactive_parameter_menu(args: argparse.Namespace) -> argparse.Namespace:
 
         else:
             print("Invalid choice.")
-
-
-class Timer:
-    """Context manager that prints elapsed time for a named step."""
-    def __init__(self, label: str):
-        self.label = label
-        self._start = None
-
-    def __enter__(self):
-        self._start = _time.perf_counter()
-        print(f"[START] {self.label} ...")
-        return self
-
-    def __exit__(self, *_):
-        elapsed = _time.perf_counter() - self._start
-        print(f"[DONE]  {self.label} — {elapsed:.1f}s")
