@@ -221,3 +221,4 @@ archive/
 model/
 .vscode/
 data/
+.claude/
