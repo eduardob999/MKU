@@ -117,13 +117,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-# ── import the existing full pipeline (optional; provides g16.* primitives) ──
-# Soft-fail so this module stays importable even when the full pipeline is not
-# on the path — the driver functions that need ``g16`` will raise when called.
-try:
-    import gaussian16_pipeline as g16
-except ImportError:
-    g16 = None
+# ── the full Gaussian pipeline primitives (SDF→gjf→g16→parse) ────────────────
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+from ivette.module import gaussian16_core as g16
+from ivette.util import jsonstore
 
 # ── RDKit ─────────────────────────────────────────────────────────────────────
 try:
@@ -1196,6 +1194,107 @@ def run_pipeline(
         result.error_msg = "All Gaussian calculations failed."
 
     return result
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Batch runner (used by the Ivette CLI)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def batch_run(
+    sdf_dir: str,
+    work_dir: str,
+    *,
+    jobs: int = 1,
+    operation: str = "opt freq",
+    resume: bool = True,
+    checkpoint: Optional[str] = None,
+    nproc: int = 4,
+    mem: str = "4GB",
+    g16_exec: str = "g16",
+    basis_set: str = "6-31G*",
+    method: str = "B3LYP",
+    charge: int = 0,
+    multiplicity: int = 1,
+    cosmo: bool = False,
+    timeout: Optional[int] = None,
+) -> "list[g16.RunResult]":
+    """Run the Gaussian pipeline over every ``*.sdf`` in ``sdf_dir``.
+
+    Each molecule goes through ``SDF → .gjf → g16 → parse`` via
+    :func:`gaussian16_core.run_compound`. Progress is persisted to a JSON
+    checkpoint so an interrupted batch can be resumed (completed molecules are
+    skipped). With ``jobs > 1`` molecules run in parallel processes. Returns one
+    ``RunResult`` per molecule executed this invocation (each has ``.success``).
+    """
+    sdf_dir = Path(sdf_dir)
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    sdfs = sorted(sdf_dir.glob("*.sdf"))
+    if not sdfs:
+        print(f"No SDF files found in {sdf_dir}")
+        return []
+
+    ckpt_path = Path(checkpoint) if checkpoint else (work_dir / "checkpoint.json")
+    done = jsonstore.read_json(ckpt_path, default={}) if resume else {}
+
+    pending = [s for s in sdfs if not done.get(s.stem, {}).get("success")]
+    skipped = len(sdfs) - len(pending)
+    print(
+        f"Found {len(sdfs)} SDF files in {sdf_dir.name}; "
+        f"{len(pending)} to run, {skipped} already complete."
+    )
+
+    kwargs = dict(
+        g16_exec=g16_exec, basis_set=basis_set, method=method, operation=operation,
+        charge=charge, multiplicity=multiplicity, nproc=nproc, mem=mem,
+        cosmo=cosmo, timeout=timeout,
+    )
+
+    def _record(result):
+        done[result.cid] = {
+            "success": result.success,
+            "log": result.log_path,
+            "error": result.error_msg,
+        }
+        jsonstore.write_json(ckpt_path, done)
+
+    results = []
+    if jobs <= 1:
+        for i, sdf in enumerate(pending, 1):
+            print(f"[{i}/{len(pending)}] {sdf.name}", flush=True)
+            try:
+                result = g16.run_compound(str(sdf), str(work_dir), **kwargs)
+            except Exception as exc:
+                result = g16.RunResult(
+                    cid=sdf.stem, sdf_path=str(sdf), gjf_path="",
+                    log_path="", success=False, error_msg=str(exc),
+                )
+            results.append(result)
+            _record(result)
+    else:
+        with ProcessPoolExecutor(max_workers=jobs) as pool:
+            futures = {
+                pool.submit(g16.run_compound, str(sdf), str(work_dir), **kwargs): sdf
+                for sdf in pending
+            }
+            for i, future in enumerate(as_completed(futures), 1):
+                sdf = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = g16.RunResult(
+                        cid=sdf.stem, sdf_path=str(sdf), gjf_path="",
+                        log_path="", success=False, error_msg=str(exc),
+                    )
+                print(f"[{i}/{len(pending)}] {sdf.name}", flush=True)
+                results.append(result)
+                _record(result)
+
+    ok = sum(1 for r in results if r.success)
+    print(f"Batch complete: {ok}/{len(results)} succeeded "
+          f"({skipped} skipped from a previous run).")
+    return results
 
 
 # ──────────────────────────────────────────────────────────────────────────────

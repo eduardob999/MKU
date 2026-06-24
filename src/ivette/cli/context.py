@@ -1,8 +1,10 @@
 """Shared CLI context and header rendering.
 
-The single source of truth for the interactive session state — previously
-duplicated between ``__main__`` and the orphaned ``cli/header.py``.
+The single source of truth for the interactive session state. Header rendering
+is delegated to :mod:`ivette.cli.ui` so all styling lives in one place.
 """
+
+from ivette.cli import ui
 
 
 class IvetteContext:
@@ -22,18 +24,8 @@ class IvetteContext:
 context = IvetteContext()
 
 
-def render_header():
-    print()
-    print("=" * 60)
-    print("IVETTE")
-    print(f"Mode: {context.mode}")
-    if context.active_set:
-        print(f"Set: {context.active_set}")
-    if context.active_compound_set:
-        print(f"Compounds: {context.active_compound_set}")
-    if context.active_run:
-        print(f"Run: {context.active_run}")
-    for key, value in context.info.items():
-        print(f"{key}: {value}")
-    print("=" * 60)
-    print()
+def render_header(clear=True):
+    """Render the context header panel (optionally clearing the screen first)."""
+    if clear:
+        ui.clear()
+    ui.header(context)
