@@ -15,8 +15,12 @@ from __future__ import annotations
 
 import math
 import os
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
+
+from ivette.util.jsonstore import read_json, write_json
+from ivette.util.paths import GAUSSIAN_BENCHMARK_FILE
 
 # Gaussian per-job efficiency sweet spot and a hard cap on cores per job.
 DEFAULT_SWEET_SPOT = 8
@@ -25,6 +29,7 @@ DEFAULT_MAX_NPROC_PER_JOB = 16
 DEFAULT_MIN_MEM_PER_JOB_MB = 2048
 # Fraction of available RAM to leave for the OS / scratch I/O.
 DEFAULT_MEM_HEADROOM = 0.15
+DEFAULT_BENCHMARK_THREADS = (4, 6, 7)
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +163,142 @@ class GaussianResources:
             f"  -> Memory per job   : {self.mem} (%mem)\n"
             f"  -> Total core usage : {self.jobs * self.nproc}/{self.cores}"
         )
+
+
+def benchmark_key(
+    *,
+    stage: str,
+    cores: int,
+    available_mem_mb: int | None,
+    job_label: str,
+    operation: str | None = None,
+    fixed_threads: int | None = None,
+    preopt: str | None = None,
+) -> str:
+    mem_part = "unknown" if available_mem_mb is None else str(available_mem_mb)
+    parts = [f"stage={stage}", f"cores={cores}", f"mem={mem_part}", f"job={job_label}"]
+    if operation is not None:
+        parts.append(f"op={operation}")
+    if fixed_threads is not None:
+        parts.append(f"fixed_threads={fixed_threads}")
+    if preopt is not None:
+        parts.append(f"preopt={preopt}")
+    return ";".join(parts)
+
+
+def preopt_benchmark_key(*, cores: int, available_mem_mb: int | None, fixed_threads: int, job_label: str = "nitrobenzene") -> str:
+    return benchmark_key(
+        stage="preopt",
+        cores=cores,
+        available_mem_mb=available_mem_mb,
+        fixed_threads=fixed_threads,
+        job_label=job_label,
+    )
+
+
+def thread_benchmark_key(*, cores: int, available_mem_mb: int | None, preopt: str, job_label: str = "nitrobenzene") -> str:
+    return benchmark_key(
+        stage="threads",
+        cores=cores,
+        available_mem_mb=available_mem_mb,
+        preopt=preopt,
+        job_label=job_label,
+    )
+
+
+def load_benchmark_cache(path: str | Path = GAUSSIAN_BENCHMARK_FILE) -> dict:
+    return read_json(path, default={"benchmarks": {}}) or {"benchmarks": {}}
+
+
+def save_benchmark_cache(cache: dict, path: str | Path = GAUSSIAN_BENCHMARK_FILE) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    write_json(path, cache)
+
+
+def get_cached_best_threads(key: str, *, path: str | Path = GAUSSIAN_BENCHMARK_FILE) -> int | None:
+    cache = load_benchmark_cache(path)
+    entry = cache.get("benchmarks", {}).get(key)
+    if not entry:
+        return None
+    best = entry.get("best_threads", entry.get("best_value"))
+    return int(best) if best is not None else None
+
+
+def get_cached_benchmark_value(key: str, *, path: str | Path = GAUSSIAN_BENCHMARK_FILE):
+    cache = load_benchmark_cache(path)
+    entry = cache.get("benchmarks", {}).get(key)
+    if not entry:
+        return None
+    return entry.get("best_value", entry.get("best_threads"))
+
+
+def get_cached_benchmark_rows(key: str, *, path: str | Path = GAUSSIAN_BENCHMARK_FILE) -> list[dict] | None:
+    cache = load_benchmark_cache(path)
+    entry = cache.get("benchmarks", {}).get(key)
+    if not entry:
+        return None
+    rows = entry.get("runs")
+    return rows if isinstance(rows, list) else None
+
+
+def store_benchmark_result(
+    key: str,
+    rows: list[dict],
+    best_value,
+    *,
+    path: str | Path = GAUSSIAN_BENCHMARK_FILE,
+) -> None:
+    cache = load_benchmark_cache(path)
+    cache.setdefault("benchmarks", {})[key] = {
+        "updated": datetime.now().isoformat(timespec="seconds"),
+        "best_value": best_value,
+        "runs": rows,
+    }
+    if isinstance(best_value, int):
+        cache["benchmarks"][key]["best_threads"] = best_value
+    save_benchmark_cache(cache, path)
+
+
+def benchmark_thread_plan(
+    detected_cores: int,
+    *,
+    available_mem_mb: int | None = None,
+    operation: str = "opt",
+    job_label: str = "nitrobenzene",
+) -> list[int]:
+    key = benchmark_key(
+        cores=detected_cores,
+        available_mem_mb=available_mem_mb,
+        operation=operation,
+        job_label=job_label,
+    )
+    cached = get_cached_best_threads(key)
+    if cached and 1 <= cached <= detected_cores:
+        return [cached]
+
+    candidates = [t for t in DEFAULT_BENCHMARK_THREADS if 1 <= t <= detected_cores]
+    if detected_cores not in candidates:
+        candidates.append(detected_cores)
+    return sorted(dict.fromkeys(candidates))
+
+
+def default_threads_after_benchmark(
+    detected_cores: int,
+    *,
+    available_mem_mb: int | None = None,
+    operation: str = "opt",
+    job_label: str = "nitrobenzene",
+) -> int:
+    key = benchmark_key(
+        cores=detected_cores,
+        available_mem_mb=available_mem_mb,
+        operation=operation,
+        job_label=job_label,
+    )
+    cached = get_cached_best_threads(key)
+    if cached and 1 <= cached <= detected_cores:
+        return cached
+    return max(1, round(detected_cores / DEFAULT_SWEET_SPOT))
 
 
 def _format_mem(mb: int) -> str:

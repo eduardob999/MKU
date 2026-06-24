@@ -642,6 +642,8 @@ def run_compound(
     basis_set:   str   = "6-31G*",
     method:      str   = "B3LYP",
     operation:   str   = "opt freq",
+    preopt_mode: str   = "none",
+    preopt_basis_set: str = "6-31G*",
     charge:      int   = 0,
     multiplicity: int  = 1,
     nproc:       int   = 4,
@@ -658,9 +660,153 @@ def run_compound(
     work_dir = Path(work_dir) / cid
     work_dir.mkdir(parents=True, exist_ok=True)
 
+    preopt_mode_lc = preopt_mode.lower().strip()
+    if preopt_mode_lc != "none":
+        preopt_root = work_dir / "preopt"
+        preopt_root.mkdir(parents=True, exist_ok=True)
+        if preopt_mode_lc == "pm7":
+            from ivette.module import gaussian16_pipeline as gp
+
+            optimized_sdf = gp.gaussian_semiempirical_preopt(
+                sdf_path,
+                preopt_root / "pm7",
+                cid,
+                method="pm7",
+                g16_exec=g16_exec,
+                nproc=nproc,
+                mem=mem,
+                charge=charge,
+                multiplicity=multiplicity,
+                solvent=None,
+                cid=cid,
+            )
+            sdf_path = optimized_sdf
+        elif preopt_mode_lc in {"gaussian631g", "631g", "6-31g", "6-31g*"}:
+            preopt_dir = preopt_root / "gaussian631g"
+            preopt_dir.mkdir(parents=True, exist_ok=True)
+            preopt_gjf = str(preopt_dir / f"{cid}_preopt.gjf")
+            preopt_chk = str(preopt_dir / f"{cid}_preopt.chk")
+            preopt_log = str(preopt_dir / f"{cid}_preopt.log")
+            preopt_out = str(preopt_dir / f"{cid}_preopt.sdf")
+            try:
+                sdf_to_gjf(
+                    sdf_path, preopt_gjf, preopt_chk,
+                    basis_set=preopt_basis_set,
+                    method=method,
+                    operation="opt",
+                    charge=charge,
+                    multiplicity=multiplicity,
+                    nproc=nproc,
+                    mem=mem,
+                    cosmo=cosmo,
+                    title=f"CID {cid} (preopt)",
+                )
+            except Exception as exc:
+                return RunResult(
+                    cid=cid, sdf_path=sdf_path, gjf_path=preopt_gjf,
+                    log_path=preopt_log, success=False,
+                    error_msg=f"Preopt GJF build failed: {exc}",
+                )
+
+            ok, err = run_gaussian(preopt_gjf, preopt_log, g16_exec=g16_exec, timeout=timeout)
+            if not ok or not check_normal_termination(preopt_log):
+                return RunResult(
+                    cid=cid, sdf_path=sdf_path, gjf_path=preopt_gjf,
+                    log_path=preopt_log, success=False,
+                    error_msg=err or "Preopt stage aborted",
+                )
+
+            xyz_path = log_to_xyz(preopt_log)
+            try:
+                from ivette.module import gaussian16_pipeline as gp
+
+                if not gp._xyz_to_sdf(xyz_path, preopt_out, template_sdf=sdf_path):
+                    return RunResult(
+                        cid=cid, sdf_path=sdf_path, gjf_path=preopt_gjf,
+                        log_path=preopt_log, success=False,
+                        error_msg="Preopt xyz→sdf conversion failed",
+                    )
+                sdf_path = preopt_out
+            finally:
+                Path(xyz_path).unlink(missing_ok=True)
+
     gjf_path = str(work_dir / f"{cid}.gjf")
     chk_path = str(work_dir / f"{cid}.chk")
     log_path = str(work_dir / f"{cid}.log")
+    operation_lc = operation.lower()
+    split_opt_freq = bool(re.search(r"\bopt\b", operation_lc)) and bool(re.search(r"\bfreq\b", operation_lc))
+
+    if split_opt_freq:
+        opt_gjf_path = str(work_dir / f"{cid}_opt.gjf")
+        opt_chk_path = str(work_dir / f"{cid}_opt.chk")
+        opt_log_path = str(work_dir / f"{cid}_opt.log")
+        freq_gjf_path = str(work_dir / f"{cid}_freq.gjf")
+        freq_chk_path = str(work_dir / f"{cid}_freq.chk")
+        freq_log_path = str(work_dir / f"{cid}_freq.log")
+
+        # Run the optimisation first, then feed its final geometry into a
+        # separate frequency job so the two stages remain independently
+        # inspectable on disk.
+        try:
+            sdf_to_gjf(
+                sdf_path, opt_gjf_path, opt_chk_path,
+                basis_set=basis_set, method=method, operation="opt",
+                charge=charge, multiplicity=multiplicity,
+                nproc=nproc, mem=mem, cosmo=cosmo,
+                title=f"CID {cid} (opt)",
+            )
+        except Exception as exc:
+            return RunResult(
+                cid=cid, sdf_path=sdf_path, gjf_path=opt_gjf_path,
+                log_path=opt_log_path, success=False,
+                error_msg=f"GJF build failed: {exc}",
+            )
+
+        ok, err = run_gaussian(opt_gjf_path, opt_log_path, g16_exec=g16_exec, timeout=timeout)
+        if not ok or not check_normal_termination(opt_log_path):
+            return RunResult(
+                cid=cid, sdf_path=sdf_path, gjf_path=opt_gjf_path,
+                log_path=opt_log_path, success=False,
+                error_msg=err or "Opt stage aborted",
+            )
+
+        opt_step = get_opt_steps(opt_log_path, step_index=-1)
+        opt_steps = [opt_step] if opt_step else []
+        temp_xyz = log_to_xyz(opt_log_path)
+        try:
+            xyz_to_gjf(
+                temp_xyz, freq_gjf_path, freq_chk_path,
+                basis_set=basis_set, method=method, operation="freq",
+                charge=charge, multiplicity=multiplicity,
+                nproc=nproc, mem=mem, cosmo=cosmo,
+                title=f"CID {cid} (freq)",
+            )
+        except Exception as exc:
+            Path(temp_xyz).unlink(missing_ok=True)
+            return RunResult(
+                cid=cid, sdf_path=sdf_path, gjf_path=freq_gjf_path,
+                log_path=freq_log_path, success=False,
+                error_msg=f"Frequency GJF build failed: {exc}",
+            )
+        finally:
+            Path(temp_xyz).unlink(missing_ok=True)
+
+        ok, err = run_gaussian(freq_gjf_path, freq_log_path, g16_exec=g16_exec, timeout=timeout)
+        if not ok or not check_normal_termination(freq_log_path):
+            return RunResult(
+                cid=cid, sdf_path=sdf_path, gjf_path=freq_gjf_path,
+                log_path=freq_log_path, success=False,
+                error_msg=err or "Frequency stage aborted",
+            )
+
+        energy = get_final_scf_energy(freq_log_path)
+        thermo = get_thermo_data(freq_log_path)
+
+        return RunResult(
+            cid=cid, sdf_path=sdf_path, gjf_path=freq_gjf_path,
+            log_path=freq_log_path, success=True,
+            energy=energy, thermo=thermo, opt_steps=opt_steps,
+        )
 
     # ── Build input ───────────────────────────────────────────────────────────
     try:
@@ -688,9 +834,9 @@ def run_compound(
 
     # ── Parse output ──────────────────────────────────────────────────────────
     energy    = get_final_scf_energy(log_path)
-    thermo    = get_thermo_data(log_path) if "freq" in operation.lower() else None
+    thermo    = get_thermo_data(log_path) if "freq" in operation_lc else None
     opt_steps = []
-    if "opt" in operation.lower():
+    if "opt" in operation_lc:
         step = get_opt_steps(log_path, step_index=-1)
         if step:
             opt_steps.append(step)

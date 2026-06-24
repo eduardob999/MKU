@@ -1210,6 +1210,8 @@ def batch_run(
     checkpoint: Optional[str] = None,
     nproc: int = 4,
     mem: str = "4GB",
+    preopt_mode: str = "none",
+    preopt_basis_set: str = "6-31G*",
     g16_exec: str = "g16",
     basis_set: str = "6-31G*",
     method: str = "B3LYP",
@@ -1247,6 +1249,7 @@ def batch_run(
 
     kwargs = dict(
         g16_exec=g16_exec, basis_set=basis_set, method=method, operation=operation,
+        preopt_mode=preopt_mode, preopt_basis_set=preopt_basis_set,
         charge=charge, multiplicity=multiplicity, nproc=nproc, mem=mem,
         cosmo=cosmo, timeout=timeout,
     )
@@ -1475,8 +1478,8 @@ def main(argv=None) -> int:
                         help="DFT functional (default: PBE0)")
     parser.add_argument("--basis",     default="6-311G*",
                         help="Basis set (default: 6-311G*)")
-    parser.add_argument("--operation", default="opt freq",
-                        help="Gaussian task keywords (default: 'opt freq')")
+    parser.add_argument("--operation", default="opt then freq",
+                        help="Gaussian task keywords (default: 'opt then freq')")
     parser.add_argument("--nproc",     type=int, default=10,
                         help="%%nprocshared (default: 10)")
     parser.add_argument("--mem",       default="28GB",

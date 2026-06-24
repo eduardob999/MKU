@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(cd \"\\\\\\\\\\\\\\\\wsl.localhost\\\\\\\\ubuntu\\\\\\\\home\\\\\\\\edokyo\\\\\\\\git\\\\\\\\MKU\" 2>/dev/null; find src -type f 2>/dev/null | head -200; echo \"---DIRS---\"; find src -type d 2>/dev/null)"
-    ]
-  }
-}

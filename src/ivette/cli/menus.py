@@ -13,9 +13,14 @@ from pathlib import Path
 
 import pandas as pd
 
+from rdkit import Chem
+from rdkit.Chem import AllChem
+
 from ivette.cli import ui
 from ivette.cli.context import context, render_header
 from ivette.util import hardware
+from ivette.util.paths import GAUSSIAN_BENCHMARK_RUN_DIR
+from ivette.module import gaussian16_core as g16
 from ivette.util.text import slugify
 from ivette.util.paths import COMPOUND_DIR, MODEL_RUN_DIR, SDF_RUN_DIR, THERMO_RUN_DIR
 from ivette.util.storage import (
@@ -61,6 +66,152 @@ def _df_table(df, *, title=None, max_rows=20):
         for record in df.head(max_rows).itertuples(index=False, name=None)
     ]
     ui.table(columns, rows, title=title)
+
+
+def _write_nitrobenzene_benchmark_sdf(path: Path) -> None:
+    mol = Chem.MolFromSmiles("O=[N+]([O-])c1ccccc1")
+    if mol is None:
+        raise RuntimeError("Could not build nitrobenzene benchmark molecule")
+    mol = Chem.AddHs(mol)
+    if AllChem.EmbedMolecule(mol, AllChem.ETKDGv3()) != 0:
+        raise RuntimeError("Could not embed nitrobenzene benchmark molecule")
+    AllChem.UFFOptimizeMolecule(mol)
+    Chem.MolToMolFile(mol, str(path))
+
+
+def _run_thread_benchmark(benchmark_sdf: Path, benchmark_dir: Path, threads: int, mem: str):
+    from ivette.module import gaussian16_core as g16
+
+    bench_dir = benchmark_dir / f"nproc_{threads}"
+    bench_dir.mkdir(parents=True, exist_ok=True)
+    start = time.perf_counter()
+    result = g16.run_compound(
+        sdf_path=str(benchmark_sdf),
+        work_dir=str(bench_dir),
+        g16_exec="g16",
+        operation="opt then freq",
+        nproc=threads,
+        mem=mem,
+    )
+    elapsed = time.perf_counter() - start
+    return {
+        "scenario": f"pm7-preopt + opt then freq @ {threads} threads",
+        "threads": threads,
+        "success": bool(result and result.success),
+        "seconds": round(elapsed, 3),
+        "log_path": result.log_path if result else "",
+    }
+
+
+def _write_benchmark_report(benchmark_dir: Path, shared_preopt_seconds: float, rows: list[dict]) -> None:
+    report_rows = []
+    for row in rows:
+        report_rows.append({
+            "scenario": row["scenario"],
+            "threads": row["threads"],
+            "shared_preopt_seconds": round(shared_preopt_seconds, 3),
+            "run_seconds": row["seconds"],
+            "total_seconds": round(shared_preopt_seconds + row["seconds"], 3),
+            "success": row["success"],
+            "log_path": row["log_path"],
+        })
+    df = pd.DataFrame(report_rows)
+    df.to_csv(benchmark_dir / "benchmark_tensor.csv", index=False)
+
+
+def _write_stage_report(benchmark_dir: Path, filename: str, rows: list[dict]) -> None:
+    pd.DataFrame(rows).to_csv(benchmark_dir / filename, index=False)
+
+
+def _run_preopt_benchmark(benchmark_dir: Path, benchmark_sdf: Path, mem: str, nproc: int):
+    from ivette.module import gaussian16_pipeline as gp
+
+    preopt_dir = benchmark_dir / "preopt_stage"
+    preopt_dir.mkdir(parents=True, exist_ok=True)
+
+    scenarios = [
+        {"label": "no preopt", "mode": "none"},
+        {"label": "PM7 preopt", "mode": "pm7"},
+        {"label": "6-31G preopt", "mode": "gjf-6-31G*"},
+    ]
+
+    rows = []
+    for scenario in scenarios:
+        start = time.perf_counter()
+        if scenario["mode"] == "none":
+            sdf_for_dft = str(benchmark_sdf)
+        elif scenario["mode"] == "pm7":
+            sdf_for_dft = gp.gaussian_semiempirical_preopt(
+                str(benchmark_sdf),
+                preopt_dir / "pm7",
+                "nitrobenzene",
+                method="pm7",
+                g16_exec="g16",
+                nproc=nproc,
+                mem=mem,
+                cid="nitrobenzene",
+            )
+        else:
+            preopt_work = preopt_dir / "gaussian_631g"
+            preopt_work.mkdir(parents=True, exist_ok=True)
+            preopt_result = g16.run_compound(
+                sdf_path=str(benchmark_sdf),
+                work_dir=str(preopt_work),
+                g16_exec="g16",
+                basis_set="6-31G*",
+                method="PBE0",
+                operation="opt",
+                nproc=nproc,
+                mem=mem,
+            )
+            sdf_for_dft = str(benchmark_sdf)
+            if preopt_result and preopt_result.success:
+                xyz_path = g16.log_to_xyz(preopt_result.log_path)
+                try:
+                    out_sdf = preopt_work / "nitrobenzene_631g_preopt.sdf"
+                    gp._xyz_to_sdf(xyz_path, str(out_sdf), template_sdf=str(benchmark_sdf))
+                    sdf_for_dft = str(out_sdf)
+                finally:
+                    Path(xyz_path).unlink(missing_ok=True)
+
+        preopt_seconds = round(time.perf_counter() - start, 3)
+        rows.append({
+            "scenario": scenario["label"],
+            "preopt_mode": scenario["mode"],
+            "preopt_seconds": preopt_seconds,
+            "sdf_for_dft": sdf_for_dft,
+            "success": True,
+        })
+
+    _write_stage_report(benchmark_dir, "preopt_benchmark.csv", rows)
+    return rows
+
+
+def _run_cpu_benchmark(benchmark_dir: Path, preopt_row: dict, threads: list[int], mem: str):
+    run_rows = []
+    for thread_count in threads:
+        scenario_dir = benchmark_dir / "cpu_stage" / preopt_row["preopt_mode"] / f"nproc_{thread_count}"
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+        start = time.perf_counter()
+        result = g16.run_compound(
+            sdf_path=preopt_row["sdf_for_dft"],
+            work_dir=str(scenario_dir),
+            g16_exec="g16",
+            operation="opt then freq",
+            nproc=thread_count,
+            mem=mem,
+        )
+        elapsed = round(time.perf_counter() - start, 3)
+        run_rows.append({
+            "preopt_mode": preopt_row["preopt_mode"],
+            "scenario": f"{preopt_row['scenario']} @ {thread_count} threads",
+            "threads": thread_count,
+            "run_seconds": elapsed,
+            "success": bool(result and result.success),
+            "log_path": result.log_path if result else "",
+        })
+    _write_stage_report(benchmark_dir, "cpu_benchmark.csv", run_rows)
+    return run_rows
 
 
 # ============================================================
@@ -249,6 +400,79 @@ def run_gaussian_pipeline(model_id, sdf_dir, operation):
     mem = ui.ask_text("Memory per job (%mem)", plan.mem)
 
     ui.rule(f"Gaussian: {operation}")
+    benchmark_key = hardware.benchmark_key(
+        stage="tensor",
+        cores=plan.cores,
+        available_mem_mb=hardware.available_memory_mb(),
+        job_label="nitrobenzene",
+    )
+    benchmark_dir = GAUSSIAN_BENCHMARK_RUN_DIR / benchmark_key.replace(";", "_")
+    benchmark_dir.mkdir(parents=True, exist_ok=True)
+    benchmark_sdf = benchmark_dir / "nitrobenzene.sdf"
+    if not benchmark_sdf.exists():
+        _write_nitrobenzene_benchmark_sdf(benchmark_sdf)
+
+    benchmark_preopt_key = hardware.preopt_benchmark_key(
+        cores=plan.cores,
+        available_mem_mb=hardware.available_memory_mb(),
+        fixed_threads=plan.nproc,
+    )
+    benchmark_cpu_key = hardware.thread_benchmark_key(
+        cores=plan.cores,
+        available_mem_mb=hardware.available_memory_mb(),
+        preopt="winner",
+    )
+
+    preopt_rows = hardware.get_cached_benchmark_rows(benchmark_preopt_key)
+    cpu_rows = hardware.get_cached_benchmark_rows(benchmark_cpu_key)
+
+    if preopt_rows is None:
+        preopt_rows = _run_preopt_benchmark(benchmark_dir, benchmark_sdf, mem, plan.nproc)
+        best_preopt_row = min(preopt_rows, key=lambda row: row["preopt_seconds"])
+        hardware.store_benchmark_result(benchmark_preopt_key, preopt_rows, best_preopt_row["preopt_mode"])
+    else:
+        best_preopt_row = min(preopt_rows, key=lambda row: row["preopt_seconds"])
+    if cpu_rows is None:
+        benchmark_threads = hardware.benchmark_thread_plan(
+            plan.cores,
+            available_mem_mb=hardware.available_memory_mb(),
+            operation="opt then freq",
+            job_label="nitrobenzene",
+        )
+        ui.panel(
+            "Running nitrobenzene CPU benchmark using the preopt comparison winner.\n"
+            f"Threads tested: {', '.join(str(t) for t in benchmark_threads)}",
+            title="Gaussian benchmark",
+            border_style="accent",
+        )
+        cpu_rows = _run_cpu_benchmark(benchmark_dir, best_preopt_row, benchmark_threads, mem)
+        successful = [row for row in cpu_rows if row["success"]]
+        best_threads = min(successful, key=lambda row: row["run_seconds"])["threads"] if successful else plan.nproc
+        hardware.store_benchmark_result(benchmark_cpu_key, cpu_rows, best_threads)
+
+    chosen_threads = hardware.get_cached_best_threads(benchmark_cpu_key) or plan.nproc
+    ui.note(f"Benchmark complete. Cached preopt winner: {best_preopt_row['preopt_mode']}; CPU winner: {chosen_threads} threads")
+    nproc = chosen_threads
+
+    if best_preopt_row["preopt_mode"] == "none":
+        preopt_mode = "none"
+        preopt_basis_set = "6-31G*"
+    elif best_preopt_row["preopt_mode"] == "pm7":
+        preopt_mode = "pm7"
+        preopt_basis_set = "6-31G*"
+    else:
+        preopt_mode = "gaussian631g"
+        preopt_basis_set = "6-31G*"
+
+    ui.panel(
+        f"Preopt method  : {best_preopt_row['preopt_mode']} ({best_preopt_row['preopt_seconds']:.3f}s)\n"
+        f"Cores per job  : {nproc} threads\n"
+        f"Parallel jobs  : {jobs}\n"
+        f"Memory per job : {mem}",
+        title="Gaussian configuration (from benchmarks)",
+        border_style="info",
+    )
+
     results = batch_run(
         sdf_dir=str(sdf_dir),
         work_dir=str(gaussian_root),
@@ -258,6 +482,8 @@ def run_gaussian_pipeline(model_id, sdf_dir, operation):
         checkpoint=str(checkpoint),
         nproc=nproc,
         mem=mem,
+        preopt_mode=preopt_mode,
+        preopt_basis_set=preopt_basis_set,
     )
 
     success = sum(r.success for r in results)
@@ -593,7 +819,7 @@ def sdf_set_menu(model_id, row, sdf_dir):
         action = ui.select(
             "Actions",
             [
-                ("Run Gaussian optimization + frequency", "opt"),
+                ("Run Gaussian opt then freq", "opt"),
                 ("Run Gaussian single point", "sp"),
                 ("Delete SDF set", "delete"),
                 ("← Back", "back"),
@@ -602,7 +828,7 @@ def sdf_set_menu(model_id, row, sdf_dir):
         if action is ui.CANCEL or action == "back":
             break
         if action == "opt":
-            run_gaussian_pipeline(model_id, sdf_dir, operation="opt freq")
+            run_gaussian_pipeline(model_id, sdf_dir, operation="opt then freq")
         elif action == "sp":
             run_gaussian_pipeline(model_id, sdf_dir, operation="sp")
         elif action == "delete":
