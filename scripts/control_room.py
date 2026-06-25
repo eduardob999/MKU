@@ -13,7 +13,7 @@ Performance note: each panel fingerprints its own data files (path + mtime +
 size) and is only re-parsed/redrawn when that data actually changes, so an idle
 panel costs nothing per tick.
 
-Data sources (all under --data-dir, default <repo>/data/sdfs):
+Data sources (all under --data-dir, default <repo>/data/geometries):
     gaussian_benchmark.json              CPU scaling + preopt comparison
     **/gaussian/**/checkpoint.json       batch progress / throughput
     **/<cid>_opt.log                     optimization convergence
@@ -637,7 +637,7 @@ class ControlRoom:
 def main():
     repo_root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description="Ivette Gaussian control room")
-    parser.add_argument("--data-dir", type=Path, default=repo_root / "data" / "sdfs",
+    parser.add_argument("--data-dir", type=Path, default=repo_root / "data" / "geometries",
                         help="Directory holding benchmark JSON + run logs")
     parser.add_argument("--interval", type=float, default=4.0, help="Refresh seconds")
     parser.add_argument("--once", action="store_true", help="Render one PNG and exit")

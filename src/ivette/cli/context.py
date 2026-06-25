@@ -14,7 +14,7 @@ class IvetteContext:
         self.clear()
 
     def clear(self):
-        self.mode = "Structure Sets"
+        self.mode = "Structure Libraries"
         self.active_set = None
         self.active_compound_set = None
         self.active_run = None

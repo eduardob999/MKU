@@ -1,9 +1,14 @@
-"""Persistence layer for Ivette entities (structures, compounds, runs, models, SDFs).
+"""Persistence layer for Ivette entities.
 
-All metadata lives in per-entity JSON files described by :mod:`ivette.util.paths`
-and is accessed through :class:`ivette.util.jsonstore.MetadataStore` instances —
-replacing the five hand-written load/save/next-id triplets that used to live in
-``__main__``.
+Entities (coherent vocabulary):
+    structure library   generated molecular structures
+    compound library    PubChem compounds + physicochemical properties
+    property dataset     find_thermo NIST/PubMed/pharma mining run
+    model                trained regressors per target
+    geometry set         3D SDF geometries for DFT
+
+All metadata lives in per-entity JSON files (see :mod:`ivette.util.paths`)
+accessed through :class:`ivette.util.jsonstore.MetadataStore` instances.
 """
 
 from datetime import datetime
@@ -17,20 +22,20 @@ from ivette.util.paths import (
     STRUCTURE_METADATA_FILE,
     COMPOUND_DIR,
     COMPOUND_METADATA_FILE,
-    THERMO_RUN_DIR,
-    THERMO_METADATA_FILE,
+    DATASET_RUN_DIR,
+    DATASET_METADATA_FILE,
     MODEL_RUN_DIR,
     MODEL_METADATA_FILE,
-    SDF_RUN_DIR,
-    SDF_METADATA_FILE,
+    GEOMETRY_RUN_DIR,
+    GEOMETRY_METADATA_FILE,
 )
 
 # One store per entity. Args: (file, top-level key, id prefix).
-STRUCTURES = MetadataStore(STRUCTURE_METADATA_FILE, "sets", "set")
-COMPOUNDS = MetadataStore(COMPOUND_METADATA_FILE, "sets", "cset")
-SDFS = MetadataStore(SDF_METADATA_FILE, "sets", "sdf")
+STRUCTURES = MetadataStore(STRUCTURE_METADATA_FILE, "structures", "structure")
+COMPOUNDS = MetadataStore(COMPOUND_METADATA_FILE, "compounds", "compound")
+DATASETS = MetadataStore(DATASET_METADATA_FILE, "datasets", "dataset")
 MODELS = MetadataStore(MODEL_METADATA_FILE, "models", "model")
-RUNS = MetadataStore(THERMO_METADATA_FILE, "runs", "run")
+GEOMETRIES = MetadataStore(GEOMETRY_METADATA_FILE, "geometries", "geometry")
 
 
 def _now():
@@ -39,24 +44,24 @@ def _now():
 
 def ensure_storage():
     """Create every data directory and an empty metadata file where missing."""
-    for store in (STRUCTURES, COMPOUNDS, SDFS, MODELS, RUNS):
+    for store in (STRUCTURES, COMPOUNDS, DATASETS, MODELS, GEOMETRIES):
         store.ensure()
-    for run_dir in (THERMO_RUN_DIR, SDF_RUN_DIR, MODEL_RUN_DIR):
+    for run_dir in (DATASET_RUN_DIR, GEOMETRY_RUN_DIR, MODEL_RUN_DIR):
         run_dir.mkdir(parents=True, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
-# Structure sets
+# Structure libraries
 # ---------------------------------------------------------------------------
 
-def save_structure_set(structure_set, name):
+def save_structure_library(structure_set, name):
     md = STRUCTURES.load()
-    set_id = STRUCTURES.next_id(md)
-    filename = f"{set_id}.csv"
+    structure_id = STRUCTURES.next_id(md)
+    filename = f"{structure_id}.csv"
     df = pd.DataFrame(structure_set["structures"])
     STRUCTURE_DIR.mkdir(parents=True, exist_ok=True)
     df.to_csv(STRUCTURE_DIR / filename, index=False)
-    md["sets"][set_id] = {
+    md["structures"][structure_id] = {
         "name": name,
         "file": filename,
         "created": _now(),
@@ -68,59 +73,59 @@ def save_structure_set(structure_set, name):
         "structure_count": len(df),
     }
     STRUCTURES.save(md)
-    return set_id
+    return structure_id
 
 
-def load_structure_set(set_id):
-    info = STRUCTURES.get(set_id)
+def load_structure_library(structure_id):
+    info = STRUCTURES.get(structure_id)
     df = pd.read_csv(STRUCTURE_DIR / info["file"])
     return info, df
 
 
 # ---------------------------------------------------------------------------
-# Compound sets
+# Compound libraries
 # ---------------------------------------------------------------------------
 
-def save_compound_set(rows, name, source_set_id, parameters):
+def save_compound_library(rows, name, structure_id, parameters):
     md = COMPOUNDS.load()
-    cset_id = COMPOUNDS.next_id(md)
-    filename = f"{cset_id}.csv"
+    compound_id = COMPOUNDS.next_id(md)
+    filename = f"{compound_id}.csv"
     df = pd.DataFrame(rows)
     COMPOUND_DIR.mkdir(parents=True, exist_ok=True)
     df.to_csv(COMPOUND_DIR / filename, index=False)
-    md["sets"][cset_id] = {
+    md["compounds"][compound_id] = {
         "name": name,
         "file": filename,
         "created": _now(),
-        "source_set_id": source_set_id,
+        "source_structure_id": structure_id,
         "parameters": parameters,
         "compound_count": len(df),
     }
     COMPOUNDS.save(md)
-    return cset_id, df
+    return compound_id, df
 
 
-def load_compound_set(cset_id):
-    info = COMPOUNDS.get(cset_id)
+def load_compound_library(compound_id):
+    info = COMPOUNDS.get(compound_id)
     df = pd.read_csv(COMPOUND_DIR / info["file"])
     return info, df
 
 
-def compound_sets_for_structure_set(set_id):
-    """List of (cset_id, info) linked to a given structure set."""
+def compound_libraries_for_structure(structure_id):
+    """List of (compound_id, info) linked to a given structure library."""
     return [
-        (cset_id, info)
-        for cset_id, info in COMPOUNDS.items()
-        if info.get("source_set_id") == set_id
+        (compound_id, info)
+        for compound_id, info in COMPOUNDS.items()
+        if info.get("source_structure_id") == structure_id
     ]
 
 
 # ---------------------------------------------------------------------------
-# SDF sets
+# Geometry sets
 # ---------------------------------------------------------------------------
 
-def register_sdf_set(model_id, target, name, output_dir, parameters, count):
-    return SDFS.register({
+def register_geometry_set(model_id, target, name, output_dir, parameters, count):
+    return GEOMETRIES.register({
         "name": name,
         "model_id": model_id,
         "target": target,
@@ -131,24 +136,30 @@ def register_sdf_set(model_id, target, name, output_dir, parameters, count):
     })
 
 
-def sdf_sets_for_model(model_id, target=None):
+def geometry_sets_for_model(model_id, target=None):
     return [
-        (sdf_id, info)
-        for sdf_id, info in SDFS.items()
+        (geometry_id, info)
+        for geometry_id, info in GEOMETRIES.items()
         if info.get("model_id") == model_id
         and (target is None or info.get("target") == target)
     ]
 
 
-def find_model_sdf_sets(model_id):
+def find_model_geometry_sets(model_id, target=None):
+    """Geometry-set directories for a model, optionally scoped to a single target.
+
+    A geometry set belongs to exactly one (model, target) pair, so passing
+    ``target`` keeps each set under its own target submenu only.
+    """
     return sorted(
         Path(info["output_dir"])
-        for info in SDFS.records().values()
+        for info in GEOMETRIES.records().values()
         if info.get("model_id") == model_id
+        and (target is None or info.get("target") == target)
     )
 
 
-def count_sdfs(folder):
+def count_geometries(folder):
     return len(list(folder.glob("*.sdf")))
 
 
@@ -156,32 +167,32 @@ def count_sdfs(folder):
 # Models
 # ---------------------------------------------------------------------------
 
-def register_model(thermo_run_id, name, parameters, output_dir):
+def register_model(dataset_id, name, parameters, output_dir):
     return MODELS.register({
         "name": name,
-        "thermo_run_id": thermo_run_id,
+        "dataset_id": dataset_id,
         "created": _now(),
         "parameters": parameters,
         "output_dir": str(output_dir),
     })
 
 
-def models_for_run(run_id):
+def models_for_dataset(dataset_id):
     return [
         (model_id, info)
         for model_id, info in MODELS.items()
-        if info.get("thermo_run_id") == run_id
+        if info.get("dataset_id") == dataset_id
     ]
 
 
 # ---------------------------------------------------------------------------
-# Thermo runs
+# Property datasets
 # ---------------------------------------------------------------------------
 
-def register_run(cset_id, name, parameters, output_dir):
-    return RUNS.register({
+def register_dataset(compound_id, name, parameters, output_dir):
+    return DATASETS.register({
         "name": name,
-        "cset_id": cset_id,
+        "compound_id": compound_id,
         "created": _now(),
         "parameters": parameters,
         "output_dir": str(output_dir),
@@ -189,17 +200,17 @@ def register_run(cset_id, name, parameters, output_dir):
     })
 
 
-def runs_for_compound_set(cset_id):
+def datasets_for_compound(compound_id):
     return [
-        (run_id, info)
-        for run_id, info in RUNS.items()
-        if info.get("cset_id") == cset_id
+        (dataset_id, info)
+        for dataset_id, info in DATASETS.items()
+        if info.get("compound_id") == compound_id
     ]
 
 
-def update_run_status(run_id, status):
-    RUNS.update(run_id, status=status)
+def update_dataset_status(dataset_id, status):
+    DATASETS.update(dataset_id, status=status)
 
 
-def load_run_info(run_id):
-    return RUNS.get(run_id)
+def load_dataset_info(dataset_id):
+    return DATASETS.get(dataset_id)

@@ -8,6 +8,8 @@ stays fixed in place.
 """
 
 import shutil
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -19,30 +21,32 @@ from rdkit.Chem import AllChem
 from ivette.cli import ui
 from ivette.cli.context import context, render_header
 from ivette.util import hardware
+from ivette.util import jsonstore
 from ivette.util.paths import GAUSSIAN_BENCHMARK_RUN_DIR
 from ivette.module import gaussian16_core as g16
 from ivette.util.text import slugify
-from ivette.util.paths import COMPOUND_DIR, MODEL_RUN_DIR, SDF_RUN_DIR, THERMO_RUN_DIR
+from ivette.util.paths import COMPOUND_DIR, MODEL_RUN_DIR, GEOMETRY_RUN_DIR, DATASET_RUN_DIR
 from ivette.util.storage import (
+    COMPOUNDS,
     MODELS,
-    RUNS,
-    SDFS,
+    DATASETS,
+    GEOMETRIES,
     STRUCTURES,
     ensure_storage,
-    save_structure_set,
-    load_structure_set,
-    save_compound_set,
-    load_compound_set,
-    compound_sets_for_structure_set,
-    register_sdf_set,
-    find_model_sdf_sets,
-    count_sdfs,
+    save_structure_library,
+    load_structure_library,
+    save_compound_library,
+    load_compound_library,
+    compound_libraries_for_structure,
+    register_geometry_set,
+    find_model_geometry_sets,
+    count_geometries,
     register_model,
-    models_for_run,
-    register_run,
-    runs_for_compound_set,
-    update_run_status,
-    load_run_info,
+    models_for_dataset,
+    register_dataset,
+    datasets_for_compound,
+    update_dataset_status,
+    load_dataset_info,
 )
 
 from ivette.core.generate_structures import generate_structures
@@ -278,7 +282,7 @@ def show_model(model_id):
     context.info = {
         "Status": "Available",
         "Created": info["created"].replace("T", " "),
-        "Thermo Run": info["thermo_run_id"],
+        "Property Dataset": info["dataset_id"],
     }
     context.active_run = None
     render_header()
@@ -345,8 +349,8 @@ def show_feature_importance(model_id):
 # Structure / compound display
 # ============================================================
 
-def show_structure_set(info, set_id):
-    context.mode = "Structure Set"
+def show_structure_library(info, structure_id):
+    context.mode = "Structure Library"
     context.active_set = info["name"]
     context.active_compound_set = None
     context.info = {
@@ -365,8 +369,8 @@ def show_structure_set(info, set_id):
     )
 
 
-def show_compound_set(info, cset_id):
-    context.mode = "Compound Set"
+def show_compound_library(info, compound_id):
+    context.mode = "Compound Library"
     context.active_compound_set = info["name"]
     context.info = {
         "Compounds": info["compound_count"],
@@ -395,19 +399,41 @@ def browse_compounds(df):
 
 
 # ============================================================
-# Gaussian / SDF helpers
+# Gaussian / geometry helpers
 # ============================================================
 
-def delete_sdf_set(sdf_id):
-    """Permanently delete an SDF set (files + metadata entry)."""
-    info = SDFS.get(sdf_id)
+def _has_content(path):
+    """True if ``path`` exists and holds data (non-empty file or directory)."""
+    p = Path(path)
+    if not p.exists():
+        return False
+    if p.is_dir():
+        return any(p.iterdir())
+    return p.stat().st_size > 0
+
+
+def _confirm_overwrite(path, what="output"):
+    """Guard a process whose output goes to ``path``.
+
+    Returns True to proceed. Prompts for permission only when ``path`` already
+    holds data, so a process writing to a fresh location never nags the user.
+    """
+    if not _has_content(path):
+        return True
+    ui.warn(f"{what} already exists at {path}")
+    return ui.confirm("Overwrite the existing data?", default=False)
+
+
+def delete_geometry_set(geometry_id):
+    """Permanently delete an Geometry set (files + metadata entry)."""
+    info = GEOMETRIES.get(geometry_id)
     if info is None:
-        ui.warn("SDF set not found in metadata.")
+        ui.warn("Geometry set not found in metadata.")
         return False
     output_dir = Path(info["output_dir"])
     ui.panel(
-        f"ID   : {sdf_id}\nName : {info.get('name')}\nPath : {output_dir}",
-        title="⚠  Permanently delete this SDF set?",
+        f"ID   : {geometry_id}\nName : {info.get('name')}\nPath : {output_dir}",
+        title="⚠  Permanently delete this Geometry set?",
         border_style="error",
     )
     if ui.ask_text("Type DELETE to confirm") != "DELETE":
@@ -415,20 +441,20 @@ def delete_sdf_set(sdf_id):
         return False
     if output_dir.exists():
         shutil.rmtree(output_dir)
-    SDFS.delete(sdf_id)
-    ui.success("SDF set deleted.")
+    GEOMETRIES.delete(geometry_id)
+    ui.success("Geometry set deleted.")
     return True
 
 
-def run_gaussian_pipeline(model_id, sdf_dir, operation):
-    gaussian_root = Path(sdf_dir) / "gaussian" / operation.replace(" ", "_")
+def run_gaussian_pipeline(model_id, geometry_dir, operation):
+    gaussian_root = Path(geometry_dir) / "gaussian" / operation.replace(" ", "_")
     gaussian_root.mkdir(parents=True, exist_ok=True)
     checkpoint = gaussian_root / "checkpoint.json"
 
     render_header()
     ui.table(
         [("Field", "muted"), ("Value", "white")],
-        [("SDF directory", sdf_dir), ("Working directory", gaussian_root),
+        [("Geometry directory", geometry_dir), ("Working directory", gaussian_root),
          ("Operation", operation)],
         title="Gaussian pipeline",
     )
@@ -445,7 +471,7 @@ def run_gaussian_pipeline(model_id, sdf_dir, operation):
     # --- Hardware optimization (before any Gaussian calculation) ------------
     # Size cores-per-job, parallel jobs, and %mem to the detected hardware and
     # the number of molecules, so the batch runs at maximum throughput.
-    n_tasks = count_sdfs(Path(sdf_dir))
+    n_tasks = count_geometries(Path(geometry_dir))
     plan = hardware.recommend_gaussian_resources(n_tasks)
     ui.panel(plan.summary(), title="⚙  Hardware optimization", border_style="accent")
     ui.note("Press Enter to accept the recommended values, or override:")
@@ -553,12 +579,36 @@ def run_gaussian_pipeline(model_id, sdf_dir, operation):
         border_style="accent",
     )
 
+    # Overwrite protection: a previous run for this Geometry set + operation reuses
+    # the same directory. Ask before touching it.
+    resume = True
+    done = jsonstore.read_json(checkpoint, default={}) if checkpoint.exists() else {}
+    n_done = sum(1 for v in done.values() if isinstance(v, dict) and v.get("success"))
+    if done or any(gaussian_root.glob("*/*.log")):
+        choice = ui.select(
+            f"Existing Gaussian results found for this Geometry set ({operation}) — "
+            f"{n_done} molecule(s) already completed.",
+            [
+                ("Resume — keep completed molecules, run only the rest", "resume"),
+                ("Restart — delete these results and recompute everything", "restart"),
+                ("Cancel — change nothing", "cancel"),
+            ],
+        )
+        if choice is ui.CANCEL or choice == "cancel":
+            ui.note("Cancelled — no data changed.")
+            ui.pause()
+            return
+        if choice == "restart":
+            shutil.rmtree(gaussian_root, ignore_errors=True)
+            gaussian_root.mkdir(parents=True, exist_ok=True)
+            resume = False
+
     results = batch_run(
-        sdf_dir=str(sdf_dir),
+        geometry_dir=str(geometry_dir),
         work_dir=str(gaussian_root),
         jobs=jobs,
         operation=operation,
-        resume=True,
+        resume=resume,
         checkpoint=str(checkpoint),
         nproc=nproc,
         mem=mem,
@@ -579,13 +629,13 @@ def run_gaussian_pipeline(model_id, sdf_dir, operation):
 # Structure menus
 # ============================================================
 
-def generate_structure_menu():
-    context.mode = "Generating Structure Set"
+def generate_structure_library_menu():
+    context.mode = "Generating Structure Library"
     context.active_set = None
     context.info = {}
     render_header()
 
-    name = ui.ask_text("Structure set name")
+    name = ui.ask_text("Structure library name")
     if not name:
         ui.warn("Cancelled.")
         ui.pause()
@@ -593,23 +643,23 @@ def generate_structure_menu():
 
     with ui.status("Generating structures…"):
         structure_set = generate_structures(ring_sizes=(5, 6))
-    set_id = save_structure_set(structure_set, name)
+    structure_id = save_structure_library(structure_set, name)
 
     ui.success(
-        f"Created '{name}'  ({set_id}) — "
+        f"Created '{name}'  ({structure_id}) — "
         f"{len(structure_set['structures'])} structures"
     )
     ui.pause()
 
 
-def download_compounds_menu(set_id, df):
+def download_compound_library_menu(structure_id, df):
     """Prompt for download parameters and fetch PubChem compounds for each
-    SMILES in the structure set."""
+    SMILES in the structure library."""
     context.mode = "Downloading Compounds"
     context.info = {}
     render_header()
 
-    name = ui.ask_text("Compound set name")
+    name = ui.ask_text("Compound library name")
     if not name:
         ui.warn("Cancelled.")
         ui.pause()
@@ -617,7 +667,7 @@ def download_compounds_menu(set_id, df):
 
     smiles_candidates = [c for c in df.columns if "smiles" in c.lower()]
     if not smiles_candidates:
-        ui.error("No SMILES column found in the structure set.")
+        ui.error("No SMILES column found in the structure library.")
         ui.pause()
         return
 
@@ -721,9 +771,9 @@ def download_compounds_menu(set_id, df):
         "sleep": sleep,
         "smiles_column": smiles_col,
     }
-    cset_id, df_out = save_compound_set(unique_rows, name, set_id, parameters)
+    compound_id, df_out = save_compound_library(unique_rows, name, structure_id, parameters)
 
-    ui.success(f"Created '{name}'  ({cset_id}) — {len(df_out)} compounds")
+    ui.success(f"Created '{name}'  ({compound_id}) — {len(df_out)} compounds")
     ui.pause()
 
 
@@ -731,8 +781,8 @@ def download_compounds_menu(set_id, df):
 # Model menus
 # ============================================================
 
-def generate_model_menu(run_id):
-    info = load_run_info(run_id)
+def generate_model_menu(dataset_id):
+    info = load_dataset_info(dataset_id)
     context.mode = "Training Model"
     context.info = {}
     render_header()
@@ -745,6 +795,10 @@ def generate_model_menu(run_id):
 
     model_id = MODELS.next_id()
     output_dir = MODEL_RUN_DIR / model_id
+    if not _confirm_overwrite(output_dir, "Model output"):
+        ui.note("Cancelled.")
+        ui.pause()
+        return
     output_dir.mkdir(parents=True, exist_ok=True)
 
     thermo_dir = Path(info["output_dir"])
@@ -758,7 +812,7 @@ def generate_model_menu(run_id):
         return
 
     parameters = {"radius": 2, "nbits": 512, "source_dataset": str(input_file)}
-    register_model(run_id, name, parameters, output_dir)
+    register_model(dataset_id, name, parameters, output_dir)
 
     ui.rule("Training model")
     argv = [
@@ -815,7 +869,8 @@ def model_menu(model_id):
 
 def individual_model_menu(model_id, row):
     while True:
-        sdf_sets = find_model_sdf_sets(model_id)
+        # Each Geometry set belongs to one (model, target); only show this target's.
+        geometry_sets = find_model_geometry_sets(model_id, row["target"])
 
         render_header()
         ui.table(
@@ -826,31 +881,31 @@ def individual_model_menu(model_id, row):
         )
 
         choices = [
-            (f"{s.name}  ({count_sdfs(s)} compounds)", ("open", i))
-            for i, s in enumerate(sdf_sets)
+            (f"{s.name}  ({count_geometries(s)} compounds)", ("open", i))
+            for i, s in enumerate(geometry_sets)
         ]
-        choices.append(("＋ Generate new SDF set", ("new", None)))
+        choices.append(("＋ Generate new Geometry set", ("new", None)))
         choices.append(("← Back", ("back", None)))
 
-        choice = ui.select("SDF sets", choices)
+        choice = ui.select("Geometry sets", choices)
         action, i = (("back", None) if choice is ui.CANCEL else choice)
         if action == "back":
             break
         if action == "open":
-            sdf_set_menu(model_id, row, sdf_sets[i])
+            geometry_set_menu(model_id, row, geometry_sets[i])
         elif action == "new":
-            generate_sdf_set(model_id, row)
+            generate_geometry_set(model_id, row)
 
 
-def generate_sdf_set(model_id, row):
+def generate_geometry_set(model_id, row):
     target = row["target"]
     model_info = MODELS.get(model_id)
 
-    context.mode = "Generating SDF Set"
+    context.mode = "Generating Geometry Set"
     context.info = {}
     render_header()
 
-    name = ui.ask_text("SDF set name")
+    name = ui.ask_text("Geometry set name")
     if not name:
         return
 
@@ -868,8 +923,12 @@ def generate_sdf_set(model_id, row):
 
     df_target = df[["CID", target]].dropna(subset=[target])
 
-    sdf_id = SDFS.next_id()
-    output_dir = SDF_RUN_DIR / sdf_id
+    geometry_id = GEOMETRIES.next_id()
+    output_dir = GEOMETRY_RUN_DIR / geometry_id
+    if not _confirm_overwrite(output_dir, "Geometry set output"):
+        ui.note("Cancelled.")
+        ui.pause()
+        return
     output_dir.mkdir(parents=True, exist_ok=True)
 
     temp_csv = output_dir / "training.csv"
@@ -879,58 +938,58 @@ def generate_sdf_set(model_id, row):
     download_training_sdfs_main(["--input", str(temp_csv), "--output-dir", str(output_dir)])
 
     count = len(list(output_dir.glob("*.sdf")))
-    register_sdf_set(
+    register_geometry_set(
         model_id, target, name, output_dir,
         {"target": target, "dataset": str(dataset), "rows": len(df_target)},
         count,
     )
-    ui.success(f"SDF set created — {count} compounds")
+    ui.success(f"Geometry set created — {count} compounds")
     ui.pause()
 
 
-def sdf_set_menu(model_id, row, sdf_dir):
+def geometry_set_menu(model_id, row, geometry_dir):
     while True:
         render_header()
         ui.table(
             [("Field", "muted"), ("Value", "white")],
-            [("SDF set", sdf_dir.name), ("Compounds", count_sdfs(sdf_dir))],
-            title="Selected SDF set",
+            [("Geometry set", geometry_dir.name), ("Compounds", count_geometries(geometry_dir))],
+            title="Selected Geometry set",
         )
         action = ui.select(
             "Actions",
             [
                 ("Run Gaussian opt then freq", "opt"),
                 ("Run Gaussian single point", "sp"),
-                ("Delete SDF set", "delete"),
+                ("Delete Geometry set", "delete"),
                 ("← Back", "back"),
             ],
         )
         if action is ui.CANCEL or action == "back":
             break
         if action == "opt":
-            run_gaussian_pipeline(model_id, sdf_dir, operation="opt then freq")
+            run_gaussian_pipeline(model_id, geometry_dir, operation="opt then freq")
         elif action == "sp":
-            run_gaussian_pipeline(model_id, sdf_dir, operation="sp")
+            run_gaussian_pipeline(model_id, geometry_dir, operation="sp")
         elif action == "delete":
-            sdf_id = next(
-                (k for k, v in SDFS.items() if Path(v["output_dir"]) == sdf_dir),
+            geometry_id = next(
+                (k for k, v in GEOMETRIES.items() if Path(v["output_dir"]) == geometry_dir),
                 None,
             )
-            if sdf_id is None:
-                ui.warn("Could not resolve SDF ID.")
+            if geometry_id is None:
+                ui.warn("Could not resolve geometry ID.")
                 continue
-            if delete_sdf_set(sdf_id):
+            if delete_geometry_set(geometry_id):
                 ui.pause()
                 break
 
 
 # ============================================================
-# Thermo run display
+# Property dataset display
 # ============================================================
 
-def show_run(run_id):
-    info = load_run_info(run_id)
-    context.mode = "Thermo Run"
+def show_dataset(dataset_id):
+    info = load_dataset_info(dataset_id)
+    context.mode = "Property Dataset"
     context.active_run = info["name"]
     context.info = {
         "Status": info["status"],
@@ -940,8 +999,8 @@ def show_run(run_id):
     return info
 
 
-def browse_run_outputs(run_id):
-    info = show_run(run_id)
+def browse_dataset_outputs(dataset_id):
+    info = show_dataset(dataset_id)
     output_dir = Path(info["output_dir"])
     output_files = sorted(output_dir.glob("*.csv")) + sorted(output_dir.glob("*.txt"))
     if not output_files:
@@ -954,16 +1013,16 @@ def browse_run_outputs(run_id):
     )
 
 
-def preview_run_output(run_id):
+def preview_dataset_output(dataset_id):
     """Pick an output CSV and print its first 20 rows."""
-    info = load_run_info(run_id)
+    info = load_dataset_info(dataset_id)
     output_dir = Path(info["output_dir"])
     csvs = sorted(output_dir.glob("*.csv"))
     if not csvs:
         ui.note("No CSV outputs found.")
         return
 
-    show_run(run_id)
+    show_dataset(dataset_id)
     chosen = ui.select(
         "Choose a file to preview",
         [(f.name, f) for f in csvs] + [("← Cancel", None)],
@@ -985,10 +1044,10 @@ def preview_run_output(run_id):
 
 
 # ============================================================
-# Thermo parameter prompts
+# Property dataset parameter prompts
 # ============================================================
 
-def prompt_run_parameters():
+def prompt_dataset_parameters():
     ui.rule("Run parameters")
     return {
         "max_compounds": ui.ask_int("Max compounds to process (0 = all)", 0),
@@ -1005,11 +1064,11 @@ def prompt_run_parameters():
 
 
 # ============================================================
-# Thermo menus
+# Property dataset menus
 # ============================================================
 
-def new_run_menu(cset_id):
-    context.mode = "New Thermo Run"
+def new_dataset_menu(compound_id):
+    context.mode = "New Property Dataset"
     context.active_run = None
     context.info = {}
     render_header()
@@ -1020,11 +1079,15 @@ def new_run_menu(cset_id):
         ui.pause()
         return
 
-    params = prompt_run_parameters()
+    params = prompt_dataset_parameters()
 
     # Reserve output directory using the prospective run ID.
-    provisional_id = RUNS.next_id()
-    output_dir = THERMO_RUN_DIR / provisional_id
+    provisional_id = DATASETS.next_id()
+    output_dir = DATASET_RUN_DIR / provisional_id
+    if not _confirm_overwrite(output_dir, "Property dataset output"):
+        ui.note("Cancelled.")
+        ui.pause()
+        return
     output_dir.mkdir(parents=True, exist_ok=True)
 
     render_header()
@@ -1046,12 +1109,12 @@ def new_run_menu(cset_id):
         ui.pause()
         return
 
-    run_id = register_run(cset_id, name, params, output_dir)
-    update_run_status(run_id, "running")
+    dataset_id = register_dataset(compound_id, name, params, output_dir)
+    update_dataset_status(dataset_id, "running")
     context.active_run = name
 
-    cset_info, _ = load_compound_set(cset_id)
-    input_csv = str(COMPOUND_DIR / cset_info["file"])
+    compound_info, _ = load_compound_library(compound_id)
+    input_csv = str(COMPOUND_DIR / compound_info["file"])
 
     argv = [
         "--input", input_csv,
@@ -1083,18 +1146,18 @@ def new_run_menu(cset_id):
     ui.rule("Running find_thermo")
     try:
         find_thermo_main(argv)
-        update_run_status(run_id, "completed")
+        update_dataset_status(dataset_id, "completed")
         ui.success("Run completed.")
     except Exception as exc:
-        update_run_status(run_id, f"failed: {exc}")
+        update_dataset_status(dataset_id, f"failed: {exc}")
         ui.error(f"Run failed: {exc}")
     ui.pause()
 
 
-def run_menu(run_id):
+def dataset_menu(dataset_id):
     while True:
-        show_run(run_id)
-        models = models_for_run(run_id)
+        show_dataset(dataset_id)
+        models = models_for_dataset(dataset_id)
 
         choices = [
             ("Browse output files", ("browse", None)),
@@ -1105,65 +1168,65 @@ def run_menu(run_id):
             choices.append((f"Model: {info['name']}", ("model", model_id)))
         choices.append(("← Back", ("back", None)))
 
-        choice = ui.select("Thermo run", choices)
+        choice = ui.select("Property dataset", choices)
         action, payload = (("back", None) if choice is ui.CANCEL else choice)
         if action == "back":
             context.active_run = None
             context.info = {}
             break
         if action == "browse":
-            browse_run_outputs(run_id)
+            browse_dataset_outputs(dataset_id)
             ui.pause()
         elif action == "preview":
-            preview_run_output(run_id)
+            preview_dataset_output(dataset_id)
             ui.pause()
         elif action == "train":
-            generate_model_menu(run_id)
+            generate_model_menu(dataset_id)
         elif action == "model":
             model_menu(payload)
 
 
-def thermo_menu(cset_id):
+def datasets_menu(compound_id):
     while True:
-        runs = runs_for_compound_set(cset_id)
-        context.mode = "Thermo"
+        runs = datasets_for_compound(compound_id)
+        context.mode = "Property Datasets"
         context.active_run = None
         context.info = {}
         render_header()
 
         choices = []
-        for run_id, info in runs:
+        for dataset_id, info in runs:
             created = info["created"].replace("T", " ")
             choices.append((
                 f"{info['name']}  —  {info.get('status', '?')}  (created {created})",
-                ("open", run_id),
+                ("open", dataset_id),
             ))
-        choices.append(("＋ New run", ("new", None)))
+        choices.append(("＋ New dataset", ("new", None)))
         choices.append(("← Back", ("back", None)))
 
-        choice = ui.select("Thermo runs for this compound set", choices)
-        action, run_id = (("back", None) if choice is ui.CANCEL else choice)
+        choice = ui.select("Property datasets for this compound library", choices)
+        action, dataset_id = (("back", None) if choice is ui.CANCEL else choice)
         if action == "back":
             break
         if action == "open":
-            run_menu(run_id)
+            dataset_menu(dataset_id)
         elif action == "new":
-            new_run_menu(cset_id)
+            new_dataset_menu(compound_id)
 
 
 # ============================================================
 # Compound / structure menus
 # ============================================================
 
-def compound_set_menu(cset_id):
-    info, df = load_compound_set(cset_id)
+def compound_library_menu(compound_id):
+    info, df = load_compound_library(compound_id)
     while True:
-        show_compound_set(info, cset_id)
+        show_compound_library(info, compound_id)
         action = ui.select(
             "Actions",
             [
                 ("Browse compounds", "browse"),
-                ("Thermo", "thermo"),
+                ("Property datasets", "thermo"),
                 ("← Back", "back"),
             ],
         )
@@ -1175,44 +1238,44 @@ def compound_set_menu(cset_id):
             browse_compounds(df)
             ui.pause()
         elif action == "thermo":
-            thermo_menu(cset_id)
+            datasets_menu(compound_id)
 
 
-def compounds_menu(set_id):
-    """List compound sets linked to this structure set and allow downloading a
+def compound_libraries_menu(structure_id):
+    """List compound librarys linked to this structure library and allow downloading a
     new one or opening an existing one."""
     while True:
-        csets = compound_sets_for_structure_set(set_id)
-        context.mode = "Compounds"
+        csets = compound_libraries_for_structure(structure_id)
+        context.mode = "Compound Libraries"
         context.active_compound_set = None
         context.info = {}
         render_header()
 
         choices = []
-        for cset_id, info in csets:
+        for compound_id, info in csets:
             created = info["created"].replace("T", " ")
             choices.append((
                 f"{info['name']}  ({info['compound_count']} compounds, created {created})",
-                ("open", cset_id),
+                ("open", compound_id),
             ))
-        choices.append(("＋ Download new compound set", ("new", None)))
+        choices.append(("＋ Download new compound library", ("new", None)))
         choices.append(("← Back", ("back", None)))
 
-        choice = ui.select("Compound sets for this structure set", choices)
-        action, cset_id = (("back", None) if choice is ui.CANCEL else choice)
+        choice = ui.select("Compound libraries for this structure library", choices)
+        action, compound_id = (("back", None) if choice is ui.CANCEL else choice)
         if action == "back":
             break
         if action == "open":
-            compound_set_menu(cset_id)
+            compound_library_menu(compound_id)
         elif action == "new":
-            _, df = load_structure_set(set_id)
-            download_compounds_menu(set_id, df)
+            _, df = load_structure_library(structure_id)
+            download_compound_library_menu(structure_id, df)
 
 
-def structure_set_menu(set_id):
-    info, df = load_structure_set(set_id)
+def structure_library_menu(structure_id):
+    info, df = load_structure_library(structure_id)
     while True:
-        show_structure_set(info, set_id)
+        show_structure_library(info, structure_id)
         action = ui.select(
             "Actions",
             [
@@ -1228,14 +1291,108 @@ def structure_set_menu(set_id):
             browse_structures(df)
             ui.pause()
         elif action == "compounds":
-            compounds_menu(set_id)
+            compound_libraries_menu(structure_id)
+
+
+# ============================================================
+# Results & Reports (interactive matplotlib explorer)
+# ============================================================
+
+_SRC_DIR = Path(__file__).resolve().parents[2]      # …/src
+_REPO_ROOT = Path(__file__).resolve().parents[3]    # repo root
+
+
+def _launch(cmd, *, cwd=None, what="plot"):
+    """Run a GUI subprocess (blocking), surfacing failures in the CLI."""
+    ui.note(f"Opening {what} window — close it to return…")
+    try:
+        result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    except Exception as exc:
+        ui.error(f"Could not open {what}: {exc}")
+        ui.pause()
+        return
+    if result.returncode != 0:
+        ui.error(f"{what} failed:\n{(result.stderr or '').strip()[-700:]}")
+        ui.pause()
+
+
+def _launch_viz(kind, *ids):
+    # Run from src/ so `ivette` resolves to the package (not the root ivette.py).
+    _launch([sys.executable, "-m", "ivette.viz", kind, *map(str, ids)],
+            cwd=str(_SRC_DIR), what="plot")
+
+
+def _launch_control_room():
+    _launch([sys.executable, str(_REPO_ROOT / "scripts" / "control_room.py")],
+            what="control room")
+
+
+def _report_entities(title, store, kind, show_fn):
+    """List entities of one stage; show metadata then offer the interactive plot."""
+    while True:
+        items = list(store.items())
+        context.mode = f"Reports · {title}"
+        context.active_set = context.active_compound_set = context.active_run = None
+        context.info = {}
+        render_header()
+        if not items:
+            ui.note(f"No {title.lower()} yet.")
+            ui.pause()
+            return
+        choices = [(f"{info.get('name', eid)}  ({eid})", eid) for eid, info in items]
+        choices.append(("← Back", None))
+        eid = ui.select(f"Pick from {title.lower()}", choices)
+        if eid is ui.CANCEL or eid is None:
+            return
+        show_fn(eid)
+        action = ui.select("Actions", [
+            ("📈 Open interactive plot", "plot"),
+            ("← Back", "back"),
+        ])
+        if action == "plot":
+            _launch_viz(kind, eid)
+
+
+def reports_menu():
+    while True:
+        context.mode = "Results & Reports"
+        context.active_set = context.active_compound_set = context.active_run = None
+        context.info = {}
+        render_header()
+        ui.note("Browse results & metadata from every stage; open interactive plots.")
+        action = ui.select("Results & Reports — choose a stage", [
+            ("Structure libraries", "structures"),
+            ("Compound libraries", "compounds"),
+            ("Property datasets", "thermo"),
+            ("Trained models", "models"),
+            ("Gaussian benchmarks (plot)", "benchmarks"),
+            ("Live control room (Gaussian monitor)", "control_room"),
+            ("← Back", "back"),
+        ])
+        if action is ui.CANCEL or action == "back":
+            context.clear()
+            return
+        if action == "structures":
+            _report_entities("Structure libraries", STRUCTURES, "structure_library",
+                             lambda sid: show_structure_library(STRUCTURES.get(sid), sid))
+        elif action == "compounds":
+            _report_entities("Compound libraries", COMPOUNDS, "compound_library",
+                             lambda cid: show_compound_library(COMPOUNDS.get(cid), cid))
+        elif action == "thermo":
+            _report_entities("Property datasets", DATASETS, "property_dataset", show_dataset)
+        elif action == "models":
+            _report_entities("Trained models", MODELS, "model", show_model)
+        elif action == "benchmarks":
+            _launch_viz("benchmarks")
+        elif action == "control_room":
+            _launch_control_room()
 
 
 def main():
     ensure_storage()
     with ui.fullscreen():
         while True:
-            context.mode = "Structure Sets"
+            context.mode = "Structure Libraries"
             context.active_set = None
             context.info = {}
 
@@ -1244,17 +1401,20 @@ def main():
 
             sets = list(STRUCTURES.items())
             choices = [
-                (f"{info['name']}  ({info['structure_count']} structures)", ("open", set_id))
-                for set_id, info in sets
+                (f"{info['name']}  ({info['structure_count']} structures)", ("open", structure_id))
+                for structure_id, info in sets
             ]
-            choices.append(("＋ Generate new structure set", ("new", None)))
+            choices.append(("＋ Generate new structure library", ("new", None)))
+            choices.append(("📊 Results & Reports", ("reports", None)))
             choices.append(("✕ Exit", ("exit", None)))
 
-            choice = ui.select("Structure sets", choices)
-            action, set_id = (("exit", None) if choice is ui.CANCEL else choice)
+            choice = ui.select("Structure libraries", choices)
+            action, structure_id = (("exit", None) if choice is ui.CANCEL else choice)
             if action == "exit":
                 break
             if action == "open":
-                structure_set_menu(set_id)
+                structure_library_menu(structure_id)
             elif action == "new":
-                generate_structure_menu()
+                generate_structure_library_menu()
+            elif action == "reports":
+                reports_menu()
