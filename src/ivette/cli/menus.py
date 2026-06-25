@@ -47,6 +47,11 @@ from ivette.util.storage import (
     datasets_for_compound,
     update_dataset_status,
     load_dataset_info,
+    save_dft_descriptor_set,
+    load_dft_descriptor_set,
+    dft_descriptor_sets_for_model,
+    add_dft_comparison,
+    DFT_DESCRIPTORS,
 )
 
 from ivette.core.generate_structures import generate_structures
@@ -60,6 +65,8 @@ from ivette.core.download_physchem import (
 from ivette.core.find_thermo import main as find_thermo_main
 from ivette.core.train_pipeline import main as train_pipeline_main
 from ivette.core.download_training_sdfs import main as download_training_sdfs_main
+from ivette.core.parse_dft import parse_geometry_descriptors
+from ivette.core.dft_feature_test import compare_target_with_dft
 
 
 def _df_table(df, *, title=None, max_rows=20):
@@ -818,6 +825,7 @@ def generate_model_menu(dataset_id):
     argv = [
         "--input", str(input_file),
         "--models-dir", str(output_dir),
+        "--workdir", str(output_dir),  # keep training intermediates inside the model dir
         "--radius", str(parameters["radius"]),
         "--nbits", str(parameters["nbits"]),
     ]
@@ -865,6 +873,113 @@ def model_menu(model_id):
             page -= 1
         elif action == "model":
             individual_model_menu(model_id, page_df.iloc[pos])
+
+
+def _geometry_id_for(geometry_dir):
+    return next((k for k, v in GEOMETRIES.items()
+                 if Path(v["output_dir"]) == geometry_dir), None)
+
+
+def _dft_sets_for_geometry(geometry_dir):
+    gid = _geometry_id_for(geometry_dir)
+    return [(d, info) for d, info in DFT_DESCRIPTORS.items()
+            if info.get("geometry_id") == gid]
+
+
+def _show_comparison_result(dft_id, comp):
+    render_header()
+    delta = comp["delta_cv_r2"]
+    verdict = "[success]DFT helps[/success]" if delta > 0 else "[warn]no CV gain[/warn]"
+    ui.table(
+        [("Metric", "muted"), ("Value", "white")],
+        [
+            ("Comparison", comp["id"]),
+            ("DFT set", dft_id),
+            ("Target", comp["target"]),
+            ("Created", comp["created"].replace("T", " ")),
+            ("Samples", comp["n_samples"]),
+            ("DFT-covered compounds", comp["n_dft_covered"]),
+            ("Baseline CV R\u00b2", f"{comp['baseline_cv_r2']:.4f} \u00b1 {comp['baseline_cv_std']:.3f}"),
+            ("With DFT CV R\u00b2", f"{comp['augmented_cv_r2']:.4f} \u00b1 {comp['augmented_cv_std']:.3f}"),
+            ("\u0394 CV R\u00b2", f"{delta:+.4f}  ({verdict})"),
+            ("DFT importance share", f"{comp['dft_total_importance']:.4f}"),
+        ],
+        title="DFT feature value — CV comparison",
+    )
+    top = list(comp.get("dft_importance", {}).items())[:8]
+    if top:
+        ui.table(
+            [("DFT feature", "white"), ("Importance", "muted")],
+            [(k, f"{v:.4f}") for k, v in top],
+            title="Top DFT feature importances (augmented model)",
+        )
+    ui.pause()
+
+
+def _test_dft_features(model_id, row, geometry_dir):
+    """Compare CV R\u00b2 for this target with vs without the DFT descriptors."""
+    render_header()
+    sets = _dft_sets_for_geometry(geometry_dir)
+    if not sets:
+        ui.warn("No DFT descriptor set for this geometry set yet — run "
+                "'Parse DFT descriptors (freq results)' first.")
+        ui.pause()
+        return
+    dft_id, _ = sets[-1]
+    _, dft_df = load_dft_descriptor_set(dft_id)
+
+    model_info = MODELS.get(model_id)
+    params = model_info["parameters"]
+    source = params.get("source_dataset")
+    if not source or not Path(source).exists():
+        ui.error("Model source dataset not found.")
+        ui.pause()
+        return
+
+    df = pd.read_csv(source)
+    try:
+        dataset = DATASETS.get(model_info.get("dataset_id"))
+        _, comp = load_compound_library(dataset["compound_id"])
+        smiles = comp[["CID", "SMILES"]].drop_duplicates("CID").astype({"CID": str})
+        df["CID"] = df["CID"].astype(str)
+        df = df.merge(smiles, on="CID", how="left")
+    except Exception:
+        pass
+
+    ui.info(f"Comparing '{row['target']}' with vs without DFT descriptors (set {dft_id})…")
+    with ui.status("Training baseline and DFT-augmented models…"):
+        res = compare_target_with_dft(
+            df, row["target"], dft_df,
+            radius=params.get("radius", 2), nbits=params.get("nbits", 512),
+        )
+    if "error" in res:
+        ui.warn(f"Cannot compare: {res['error']}")
+        ui.pause()
+        return
+    comp_id, entry = add_dft_comparison(dft_id, res)
+    ui.success(f"Saved comparison {comp_id}.")
+    _show_comparison_result(dft_id, entry)
+
+
+def _dft_comparisons_menu(model_id, row, geometry_dir):
+    while True:
+        render_header()
+        sets = _dft_sets_for_geometry(geometry_dir)
+        comparisons = [(d, c) for d, info in sets for c in info.get("comparisons", [])]
+        if not comparisons:
+            ui.note("No comparisons yet — run 'Test DFT features (CV comparison)' first.")
+            ui.pause()
+            return
+        choices = []
+        for dft_id, c in comparisons:
+            label = (f"{c['id']}  ·  \u0394 CV R\u00b2={c['delta_cv_r2']:+.4f}  ·  "
+                     f"{c['created'].replace('T', ' ')}")
+            choices.append((label, (dft_id, c)))
+        choices.append(("← Back", None))
+        choice = ui.select("DFT comparison results", choices)
+        if choice is ui.CANCEL or choice is None:
+            return
+        _show_comparison_result(choice[0], choice[1])
 
 
 def individual_model_menu(model_id, row):
@@ -947,6 +1062,59 @@ def generate_geometry_set(model_id, row):
     ui.pause()
 
 
+def _create_dft_descriptor_set(model_id, row, geometry_dir):
+    """Parse this geometry set's Gaussian freq logs into a new DFT descriptor set."""
+    render_header()
+    rows = parse_geometry_descriptors(geometry_dir / "gaussian")
+    if not rows:
+        ui.warn("No completed frequency calculations found here — "
+                "run 'Gaussian opt then freq' first.")
+        ui.pause()
+        return
+    ui.info(f"Parsed {len(rows)} compounds from frequency logs.")
+    name = ui.ask_text("DFT descriptor set name", f"{row['target']} DFT")
+    if not name:
+        ui.warn("Cancelled.")
+        ui.pause()
+        return
+    geometry_id = next(
+        (k for k, v in GEOMETRIES.items() if Path(v["output_dir"]) == geometry_dir),
+        None,
+    )
+    with ui.status("Saving descriptor set…"):
+        dft_id, df = save_dft_descriptor_set(
+            rows, name, model_id, row["target"], geometry_id,
+            parameters={"source_gaussian": str(geometry_dir / "gaussian")},
+        )
+    n_props = len([c for c in df.columns if c != "CID"])
+    ui.success(f"Created DFT descriptor set '{name}'  ({dft_id}) — "
+               f"{len(df)} compounds × {n_props} properties")
+    ui.pause()
+
+
+def show_dft_descriptor_set(dft_id):
+    info = DFT_DESCRIPTORS.get(dft_id)
+    context.mode = "DFT Descriptor Set"
+    context.info = {
+        "Compounds": info["compound_count"],
+        "Created": info["created"].replace("T", " "),
+    }
+    render_header()
+    ui.table(
+        [("Field", "muted"), ("Value", "white")],
+        [
+            ("Name", info["name"]),
+            ("Model", info["model_id"]),
+            ("Target", info["target"]),
+            ("Geometry set", info.get("geometry_id")),
+            ("Compounds", info["compound_count"]),
+            ("Properties", ", ".join(info.get("property_columns", []))),
+        ],
+        title="DFT descriptor set",
+    )
+    return info
+
+
 def geometry_set_menu(model_id, row, geometry_dir):
     while True:
         render_header()
@@ -960,6 +1128,9 @@ def geometry_set_menu(model_id, row, geometry_dir):
             [
                 ("Run Gaussian opt then freq", "opt"),
                 ("Run Gaussian single point", "sp"),
+                ("Parse DFT descriptors (freq results)", "dft"),
+                ("Test DFT features (CV comparison)", "dfttest"),
+                ("DFT comparison results", "dftresults"),
                 ("Delete Geometry set", "delete"),
                 ("← Back", "back"),
             ],
@@ -970,6 +1141,12 @@ def geometry_set_menu(model_id, row, geometry_dir):
             run_gaussian_pipeline(model_id, geometry_dir, operation="opt then freq")
         elif action == "sp":
             run_gaussian_pipeline(model_id, geometry_dir, operation="sp")
+        elif action == "dft":
+            _create_dft_descriptor_set(model_id, row, geometry_dir)
+        elif action == "dfttest":
+            _test_dft_features(model_id, row, geometry_dir)
+        elif action == "dftresults":
+            _dft_comparisons_menu(model_id, row, geometry_dir)
         elif action == "delete":
             geometry_id = next(
                 (k for k, v in GEOMETRIES.items() if Path(v["output_dir"]) == geometry_dir),
@@ -1365,6 +1542,7 @@ def reports_menu():
             ("Compound libraries", "compounds"),
             ("Property datasets", "thermo"),
             ("Trained models", "models"),
+            ("DFT descriptor sets", "dft"),
             ("Gaussian benchmarks (plot)", "benchmarks"),
             ("Live control room (Gaussian monitor)", "control_room"),
             ("← Back", "back"),
@@ -1382,6 +1560,8 @@ def reports_menu():
             _report_entities("Property datasets", DATASETS, "property_dataset", show_dataset)
         elif action == "models":
             _report_entities("Trained models", MODELS, "model", show_model)
+        elif action == "dft":
+            _report_entities("DFT descriptor sets", DFT_DESCRIPTORS, "dft_descriptor_set", show_dft_descriptor_set)
         elif action == "benchmarks":
             _launch_viz("benchmarks")
         elif action == "control_room":

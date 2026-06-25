@@ -28,6 +28,8 @@ from ivette.util.paths import (
     MODEL_METADATA_FILE,
     GEOMETRY_RUN_DIR,
     GEOMETRY_METADATA_FILE,
+    DFT_DESCRIPTOR_DIR,
+    DFT_DESCRIPTOR_METADATA_FILE,
 )
 
 # One store per entity. Args: (file, top-level key, id prefix).
@@ -36,6 +38,7 @@ COMPOUNDS = MetadataStore(COMPOUND_METADATA_FILE, "compounds", "compound")
 DATASETS = MetadataStore(DATASET_METADATA_FILE, "datasets", "dataset")
 MODELS = MetadataStore(MODEL_METADATA_FILE, "models", "model")
 GEOMETRIES = MetadataStore(GEOMETRY_METADATA_FILE, "geometries", "geometry")
+DFT_DESCRIPTORS = MetadataStore(DFT_DESCRIPTOR_METADATA_FILE, "dft_descriptors", "dft")
 
 
 def _now():
@@ -44,7 +47,7 @@ def _now():
 
 def ensure_storage():
     """Create every data directory and an empty metadata file where missing."""
-    for store in (STRUCTURES, COMPOUNDS, DATASETS, MODELS, GEOMETRIES):
+    for store in (STRUCTURES, COMPOUNDS, DATASETS, MODELS, GEOMETRIES, DFT_DESCRIPTORS):
         store.ensure()
     for run_dir in (DATASET_RUN_DIR, GEOMETRY_RUN_DIR, MODEL_RUN_DIR):
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -214,3 +217,56 @@ def update_dataset_status(dataset_id, status):
 
 def load_dataset_info(dataset_id):
     return DATASETS.get(dataset_id)
+
+
+# ---------------------------------------------------------------------------
+# DFT descriptor sets (parsed Gaussian freq properties, per model+target)
+# ---------------------------------------------------------------------------
+
+def save_dft_descriptor_set(rows, name, model_id, target, geometry_id, parameters=None):
+    md = DFT_DESCRIPTORS.load()
+    dft_id = DFT_DESCRIPTORS.next_id(md)
+    filename = f"{dft_id}.csv"
+    df = pd.DataFrame(rows)
+    DFT_DESCRIPTOR_DIR.mkdir(parents=True, exist_ok=True)
+    df.to_csv(DFT_DESCRIPTOR_DIR / filename, index=False)
+    md["dft_descriptors"][dft_id] = {
+        "name": name,
+        "file": filename,
+        "created": _now(),
+        "model_id": model_id,
+        "target": target,
+        "geometry_id": geometry_id,
+        "parameters": parameters or {},
+        "compound_count": len(df),
+        "property_columns": [c for c in df.columns if c != "CID"],
+    }
+    DFT_DESCRIPTORS.save(md)
+    return dft_id, df
+
+
+def load_dft_descriptor_set(dft_id):
+    info = DFT_DESCRIPTORS.get(dft_id)
+    df = pd.read_csv(DFT_DESCRIPTOR_DIR / info["file"])
+    return info, df
+
+
+def dft_descriptor_sets_for_model(model_id, target=None):
+    return [
+        (dft_id, info)
+        for dft_id, info in DFT_DESCRIPTORS.items()
+        if info.get("model_id") == model_id
+        and (target is None or info.get("target") == target)
+    ]
+
+
+def add_dft_comparison(dft_id, result):
+    """Append a CV-comparison result to a DFT descriptor set; return (id, entry)."""
+    md = DFT_DESCRIPTORS.load()
+    record = md["dft_descriptors"][dft_id]
+    comparisons = record.setdefault("comparisons", [])
+    comp_id = f"cmp_{len(comparisons) + 1:03d}"
+    entry = {"id": comp_id, "created": _now(), **result}
+    comparisons.append(entry)
+    DFT_DESCRIPTORS.save(md)
+    return comp_id, entry

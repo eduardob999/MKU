@@ -405,10 +405,41 @@ def fig_benchmarks():
     return fig, []
 
 
+def fig_dft_descriptor_set(dft_id):
+    from ivette.util.storage import load_dft_descriptor_set
+    info, df = load_dft_descriptor_set(dft_id)
+    fig = _new_fig(f"DFT descriptor set \u00b7 {info['name']} ({dft_id}) "
+                   f"\u2014 {len(df)} compounds")
+    axes = fig.subplots(2, 3).flatten()
+    props = ["gibbs_G", "enthalpy_H", "entropy_S", "zpe_correction",
+             "lowest_freq", "n_imaginary"]
+    for ax, prop in zip(axes, props):
+        if prop not in df:
+            _empty(ax, f"{prop} missing")
+        elif prop == "n_imaginary":
+            vals = pd.to_numeric(df[prop], errors="coerce").fillna(0).astype(int)
+            counts = vals.value_counts().sort_index()
+            ax.bar([str(i) for i in counts.index], counts.values,
+                   color=RED if (vals > 0).any() else GREEN)
+            ax.set_xlabel("# imaginary modes")
+            ax.set_title(prop)
+        else:
+            vals = pd.to_numeric(df[prop], errors="coerce").dropna()
+            ax.hist(vals, bins=20, color=ACCENT, edgecolor=BG)
+            if len(vals):
+                ax.axvline(vals.median(), color=GOLD, ls="--", lw=1,
+                           label=f"median {vals.median():.3g}")
+                ax.legend(fontsize=7, framealpha=0.2)
+            ax.set_title(prop)
+        _grid(ax)
+    return fig, []
+
+
 BUILDERS = {
     "structure_library": fig_structure_library,
     "compound_library": fig_compound_library,
     "property_dataset": fig_property_dataset,
     "model": fig_model,
     "benchmarks": fig_benchmarks,
+    "dft_descriptor_set": fig_dft_descriptor_set,
 }
