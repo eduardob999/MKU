@@ -16,6 +16,7 @@ import sys
 from contextlib import contextmanager
 
 import questionary
+from questionary import Separator
 from questionary import Style as QStyle
 from rich import box
 from rich.console import Console
@@ -55,11 +56,36 @@ _QSTYLE = QStyle([
     ("selected", f"fg:{ACCENT}"),
     ("answer", f"fg:{ACCENT} bold"),
     ("instruction", "fg:#808080 italic"),
-    ("separator", "fg:#606060"),
+    ("separator", "fg:#d7af5f bold"),   # section dividers — amber, distinct from cyan selection
 ])
 
 # Sentinel returned by select() when the user cancels (Esc / Ctrl-C).
 CANCEL = object()
+
+# questionary can map at most this many list items to keyboard shortcuts
+# (digits 1-9,0 then a-z). Past this we silently drop number shortcuts and the
+# user navigates with the arrow keys.
+_MAX_SHORTCUTS = 36
+
+# Colour used for section headers in the non-interactive fallback list.
+_SECTION_COLOR = "#d7af5f"
+
+
+class _Section:
+    """A non-selectable header/divider for use inside :func:`select` choices."""
+    __slots__ = ("title",)
+
+    def __init__(self, title):
+        self.title = title
+
+
+def section(title):
+    """A visible section divider to interleave with ``(label, value)`` choices.
+
+    Drop one into the list passed to :func:`select` to group the options
+    underneath it, e.g. ``[ui.section("Gaussian"), ("Run opt", "opt"), …]``.
+    """
+    return _Section(title)
 
 
 def _interactive() -> bool:
@@ -192,33 +218,58 @@ def table(columns, rows, *, title=None, caption=None):
 # ---------------------------------------------------------------------------
 
 def select(message, choices, *, default=None):
-    """Arrow-key menu. ``choices`` is a list of (label, value) pairs.
+    """Arrow- and number-key menu.
 
-    Returns the selected value, or :data:`CANCEL` if the user backs out.
-    Falls back to a numbered prompt when stdin/stdout isn't a TTY.
+    ``choices`` is a list of ``(label, value)`` pairs, optionally interleaved
+    with :func:`section` dividers to group the options into visible sections.
+    The user can move the highlight with ↑/↓ **or** by pressing the number/letter
+    shown in front of each option, then Enter to confirm.
+
+    Returns the selected value, or :data:`CANCEL` if the user backs out. Falls
+    back to a numbered prompt when stdin/stdout isn't a TTY.
     """
-    pairs = list(choices)
+    items = list(choices)
+    # Real, selectable options (section dividers excluded), in display order.
+    pairs = [it for it in items if not isinstance(it, _Section)]
+
     if _interactive():
-        qchoices = [questionary.Choice(title=label, value=i) for i, (label, _) in enumerate(pairs)]
+        qchoices, idx = [], 0
+        for it in items:
+            if isinstance(it, _Section):
+                line = f"── {it.title} ──" if it.title else "─" * 12
+                qchoices.append(Separator(line))
+            else:
+                qchoices.append(questionary.Choice(title=it[0], value=idx))
+                idx += 1
         answer = questionary.select(
             message,
             choices=qchoices,
-            default=(default if default is not None else None),
+            default=default,
             style=_QSTYLE,
             qmark="❯",
             pointer="▶",
-            instruction="(↑/↓ then Enter)",
-            use_shortcuts=False,
+            instruction="(↑/↓ or number, then Enter)",
+            # Number/letter shortcuts when the list is short enough to map them;
+            # j/k vim-nav off so it never clashes with auto-assigned letter keys.
+            use_shortcuts=len(pairs) <= _MAX_SHORTCUTS,
+            use_arrow_keys=True,
+            use_jk_keys=False,
             use_indicator=False,
         ).ask()
         if answer is None:
             return CANCEL
         return pairs[answer][1]
 
-    # Non-interactive fallback: numbered list.
+    # Non-interactive fallback: numbered list with section headers.
     console.print(f"[accent]?[/accent] [bold]{message}[/bold]")
-    for i, (label, _) in enumerate(pairs, 1):
-        console.print(f"   [accent]{i:>2}[/accent]  {label}")
+    n = 0
+    for it in items:
+        if isinstance(it, _Section):
+            line = f"── {it.title} ──" if it.title else "─" * 12
+            console.print(f"   [{_SECTION_COLOR}]{line}[/{_SECTION_COLOR}]")
+        else:
+            n += 1
+            console.print(f"   [accent]{n:>2}[/accent]  {it[0]}")
     raw = input("Select a number: ").strip()
     try:
         idx = int(raw) - 1

@@ -453,16 +453,34 @@ def delete_geometry_set(geometry_id):
     return True
 
 
-def run_gaussian_pipeline(model_id, geometry_dir, operation):
-    gaussian_root = Path(geometry_dir) / "gaussian" / operation.replace(" ", "_")
+def run_gaussian_pipeline(model_id, geometry_dir, operation, *, cosmo=False, charge_states=None):
+    """Run the full Gaussian pipeline (hardware sizing + benchmarking + batch).
+
+    ``cosmo`` switches on CPCM/water solvation (rendered as
+    ``scrf=(cpcm,solvent=water)`` by the core builder). ``charge_states`` is a
+    list of ``(label, charge, multiplicity)`` so a single invocation can cover,
+    e.g., the neutral molecule and its -1 anion. The hardware/benchmark step
+    runs ONCE and is shared by every charge state; each state gets its own work
+    directory and checkpoint, with independent overwrite/resume protection.
+    """
+    if charge_states is None:
+        charge_states = [("", 0, 1)]
+    geometry_dir = Path(geometry_dir)
+    root_name = operation.replace(" ", "_") + ("_COSMO" if cosmo else "")
+    gaussian_root = geometry_dir / "gaussian" / root_name
     gaussian_root.mkdir(parents=True, exist_ok=True)
-    checkpoint = gaussian_root / "checkpoint.json"
 
     render_header()
     ui.table(
         [("Field", "muted"), ("Value", "white")],
-        [("Geometry directory", geometry_dir), ("Working directory", gaussian_root),
-         ("Operation", operation)],
+        [
+            ("Geometry directory", geometry_dir),
+            ("Working directory", gaussian_root),
+            ("Operation", operation),
+            ("Solvation", "COSMO (CPCM, water)" if cosmo else "gas phase"),
+            ("Charge states",
+             ", ".join(f"{lbl or 'neutral'} (q={q}, mult={m})" for lbl, q, m in charge_states)),
+        ],
         title="Gaussian pipeline",
     )
 
@@ -486,7 +504,7 @@ def run_gaussian_pipeline(model_id, geometry_dir, operation):
     jobs = ui.ask_int("Parallel Gaussian jobs", plan.jobs)
     mem = ui.ask_text("Memory per job (%mem)", plan.mem)
 
-    ui.rule(f"Gaussian: {operation}")
+    ui.rule(f"Gaussian: {operation}{' + COSMO' if cosmo else ''}")
     benchmark_key = hardware.benchmark_key(
         stage="tensor",
         cores=plan.cores,
@@ -581,55 +599,69 @@ def run_gaussian_pipeline(model_id, geometry_dir, operation):
         f"Preopt method  : {best_preopt_row['preopt_mode']} ({best_preopt_row['preopt_seconds']:.3f}s)\n"
         f"Cores per job  : {nproc} threads\n"
         f"Parallel jobs  : {jobs}\n"
-        f"Memory per job : {mem}",
+        f"Memory per job : {mem}\n"
+        f"Solvation      : {'COSMO (CPCM, water)' if cosmo else 'gas phase'}",
         title="Gaussian configuration (from benchmarks)",
         border_style="accent",
     )
 
-    # Overwrite protection: a previous run for this Geometry set + operation reuses
-    # the same directory. Ask before touching it.
-    resume = True
-    done = jsonstore.read_json(checkpoint, default={}) if checkpoint.exists() else {}
-    n_done = sum(1 for v in done.values() if isinstance(v, dict) and v.get("success"))
-    if done or any(gaussian_root.glob("*/*.log")):
-        choice = ui.select(
-            f"Existing Gaussian results found for this Geometry set ({operation}) — "
-            f"{n_done} molecule(s) already completed.",
-            [
-                ("Resume — keep completed molecules, run only the rest", "resume"),
-                ("Restart — delete these results and recompute everything", "restart"),
-                ("Cancel — change nothing", "cancel"),
-            ],
+    # Production batch — once per requested charge state, all sharing the single
+    # benchmark above. Each state writes to its own subdirectory + checkpoint and
+    # gets independent overwrite/resume protection.
+    for label, charge, multiplicity in charge_states:
+        work_dir = (gaussian_root / label) if label else gaussian_root
+        work_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint = work_dir / "checkpoint.json"
+        state_name = label or "neutral"
+        ui.rule(f"{operation} — {state_name} (charge {charge}, multiplicity {multiplicity})")
+
+        # Overwrite protection: a previous run for this state reuses the same
+        # directory. Ask before touching it.
+        resume = True
+        done = jsonstore.read_json(checkpoint, default={}) if checkpoint.exists() else {}
+        n_done = sum(1 for v in done.values() if isinstance(v, dict) and v.get("success"))
+        if done or any(work_dir.glob("*/*.log")):
+            choice = ui.select(
+                f"Existing {state_name} results found ({operation}"
+                f"{' + COSMO' if cosmo else ''}) — {n_done} molecule(s) already completed.",
+                [
+                    ("Resume — keep completed molecules, run only the rest", "resume"),
+                    ("Restart — delete these results and recompute everything", "restart"),
+                    ("Skip this charge state", "skip"),
+                ],
+            )
+            if choice is ui.CANCEL or choice == "skip":
+                ui.note(f"Skipped {state_name} — no data changed.")
+                continue
+            if choice == "restart":
+                shutil.rmtree(work_dir, ignore_errors=True)
+                work_dir.mkdir(parents=True, exist_ok=True)
+                resume = False
+
+        results = batch_run(
+            sdf_dir=str(geometry_dir),
+            work_dir=str(work_dir),
+            jobs=jobs,
+            operation=operation,
+            resume=resume,
+            checkpoint=str(checkpoint),
+            nproc=nproc,
+            mem=mem,
+            preopt_mode=preopt_mode,
+            preopt_basis_set=preopt_basis_set,
+            cosmo=cosmo,
+            charge=charge,
+            multiplicity=multiplicity,
         )
-        if choice is ui.CANCEL or choice == "cancel":
-            ui.note("Cancelled — no data changed.")
-            ui.pause()
-            return
-        if choice == "restart":
-            shutil.rmtree(gaussian_root, ignore_errors=True)
-            gaussian_root.mkdir(parents=True, exist_ok=True)
-            resume = False
 
-    results = batch_run(
-        geometry_dir=str(geometry_dir),
-        work_dir=str(gaussian_root),
-        jobs=jobs,
-        operation=operation,
-        resume=resume,
-        checkpoint=str(checkpoint),
-        nproc=nproc,
-        mem=mem,
-        preopt_mode=preopt_mode,
-        preopt_basis_set=preopt_basis_set,
-    )
-
-    success = sum(r.success for r in results)
-    failed = len(results) - success
-    ui.panel(
-        f"[success]Successful:[/success] {success}\n[error]Failed:[/error] {failed}",
-        title="Gaussian finished",
-        border_style="success" if failed == 0 else "warn",
-    )
+        success = sum(r.success for r in results)
+        failed = len(results) - success
+        ui.panel(
+            f"[success]Successful:[/success] {success}\n[error]Failed:[/error] {failed}",
+            title=f"Gaussian finished — {state_name}",
+            border_style="success" if failed == 0 else "warn",
+        )
+    ui.pause()
 
 
 # ============================================================
@@ -852,11 +884,12 @@ def model_menu(model_id):
         page_df = report.iloc[start:end]
 
         show_model(model_id)
-        choices = []
+        choices = [ui.section("Trained models")]
         for pos, (_, row) in enumerate(page_df.iterrows()):
             label = (f"{row['target'][:64]}  "
                      f"(n={row['n_samples']}, CV R²={row['cv_r2_mean']:.4f})")
             choices.append((label, ("model", pos)))
+        choices.append(ui.section(""))
         if start > 0:
             choices.append(("← Previous page", ("prev", None)))
         if end < len(report):
@@ -970,11 +1003,12 @@ def _dft_comparisons_menu(model_id, row, geometry_dir):
             ui.note("No comparisons yet — run 'Test DFT features (CV comparison)' first.")
             ui.pause()
             return
-        choices = []
+        choices = [ui.section("Comparisons")]
         for dft_id, c in comparisons:
             label = (f"{c['id']}  ·  \u0394 CV R\u00b2={c['delta_cv_r2']:+.4f}  ·  "
                      f"{c['created'].replace('T', ' ')}")
             choices.append((label, (dft_id, c)))
+        choices.append(ui.section(""))
         choices.append(("← Back", None))
         choice = ui.select("DFT comparison results", choices)
         if choice is ui.CANCEL or choice is None:
@@ -995,10 +1029,14 @@ def individual_model_menu(model_id, row):
             title="Selected model",
         )
 
-        choices = [
-            (f"{s.name}  ({count_geometries(s)} compounds)", ("open", i))
-            for i, s in enumerate(geometry_sets)
-        ]
+        choices = []
+        if geometry_sets:
+            choices.append(ui.section("Geometry sets"))
+            choices += [
+                (f"{s.name}  ({count_geometries(s)} compounds)", ("open", i))
+                for i, s in enumerate(geometry_sets)
+            ]
+        choices.append(ui.section("Actions"))
         choices.append(("＋ Generate new Geometry set", ("new", None)))
         choices.append(("← Back", ("back", None)))
 
@@ -1126,11 +1164,15 @@ def geometry_set_menu(model_id, row, geometry_dir):
         action = ui.select(
             "Actions",
             [
+                ui.section("Gaussian calculations"),
                 ("Run Gaussian opt then freq", "opt"),
+                ("Run opt+freq with COSMO (neutral + anion)", "opt_cosmo"),
                 ("Run Gaussian single point", "sp"),
+                ui.section("DFT analysis"),
                 ("Parse DFT descriptors (freq results)", "dft"),
                 ("Test DFT features (CV comparison)", "dfttest"),
                 ("DFT comparison results", "dftresults"),
+                ui.section("Manage"),
                 ("Delete Geometry set", "delete"),
                 ("← Back", "back"),
             ],
@@ -1139,6 +1181,11 @@ def geometry_set_menu(model_id, row, geometry_dir):
             break
         if action == "opt":
             run_gaussian_pipeline(model_id, geometry_dir, operation="opt then freq")
+        elif action == "opt_cosmo":
+            run_gaussian_pipeline(
+                model_id, geometry_dir, operation="opt then freq", cosmo=True,
+                charge_states=[("neutral", 0, 1), ("anion", -1, 2)],
+            )
         elif action == "sp":
             run_gaussian_pipeline(model_id, geometry_dir, operation="sp")
         elif action == "dft":
@@ -1337,12 +1384,15 @@ def dataset_menu(dataset_id):
         models = models_for_dataset(dataset_id)
 
         choices = [
+            ui.section("Outputs"),
             ("Browse output files", ("browse", None)),
             ("Preview a CSV", ("preview", None)),
+            ui.section("Models"),
             ("Train new model", ("train", None)),
         ]
         for model_id, info in models:
             choices.append((f"Model: {info['name']}", ("model", model_id)))
+        choices.append(ui.section(""))
         choices.append(("← Back", ("back", None)))
 
         choice = ui.select("Property dataset", choices)
@@ -1372,12 +1422,15 @@ def datasets_menu(compound_id):
         render_header()
 
         choices = []
+        if runs:
+            choices.append(ui.section("Property datasets"))
         for dataset_id, info in runs:
             created = info["created"].replace("T", " ")
             choices.append((
                 f"{info['name']}  —  {info.get('status', '?')}  (created {created})",
                 ("open", dataset_id),
             ))
+        choices.append(ui.section("Actions"))
         choices.append(("＋ New dataset", ("new", None)))
         choices.append(("← Back", ("back", None)))
 
@@ -1402,8 +1455,10 @@ def compound_library_menu(compound_id):
         action = ui.select(
             "Actions",
             [
+                ui.section("Browse"),
                 ("Browse compounds", "browse"),
                 ("Property datasets", "thermo"),
+                ui.section(""),
                 ("← Back", "back"),
             ],
         )
@@ -1429,12 +1484,15 @@ def compound_libraries_menu(structure_id):
         render_header()
 
         choices = []
+        if csets:
+            choices.append(ui.section("Compound libraries"))
         for compound_id, info in csets:
             created = info["created"].replace("T", " ")
             choices.append((
                 f"{info['name']}  ({info['compound_count']} compounds, created {created})",
                 ("open", compound_id),
             ))
+        choices.append(ui.section("Actions"))
         choices.append(("＋ Download new compound library", ("new", None)))
         choices.append(("← Back", ("back", None)))
 
@@ -1456,8 +1514,10 @@ def structure_library_menu(structure_id):
         action = ui.select(
             "Actions",
             [
+                ui.section("Browse"),
                 ("Browse structures", "browse"),
                 ("Compounds", "compounds"),
+                ui.section(""),
                 ("← Back", "back"),
             ],
         )
@@ -1516,7 +1576,9 @@ def _report_entities(title, store, kind, show_fn):
             ui.note(f"No {title.lower()} yet.")
             ui.pause()
             return
-        choices = [(f"{info.get('name', eid)}  ({eid})", eid) for eid, info in items]
+        choices = [ui.section(title)]
+        choices += [(f"{info.get('name', eid)}  ({eid})", eid) for eid, info in items]
+        choices.append(ui.section(""))
         choices.append(("← Back", None))
         eid = ui.select(f"Pick from {title.lower()}", choices)
         if eid is ui.CANCEL or eid is None:
@@ -1538,13 +1600,16 @@ def reports_menu():
         render_header()
         ui.note("Browse results & metadata from every stage; open interactive plots.")
         action = ui.select("Results & Reports — choose a stage", [
+            ui.section("Browse data"),
             ("Structure libraries", "structures"),
             ("Compound libraries", "compounds"),
             ("Property datasets", "thermo"),
             ("Trained models", "models"),
             ("DFT descriptor sets", "dft"),
+            ui.section("Live & plots"),
             ("Gaussian benchmarks (plot)", "benchmarks"),
             ("Live control room (Gaussian monitor)", "control_room"),
+            ui.section(""),
             ("← Back", "back"),
         ])
         if action is ui.CANCEL or action == "back":
@@ -1580,10 +1645,14 @@ def main():
             ui.banner()
 
             sets = list(STRUCTURES.items())
-            choices = [
-                (f"{info['name']}  ({info['structure_count']} structures)", ("open", structure_id))
-                for structure_id, info in sets
-            ]
+            choices = []
+            if sets:
+                choices.append(ui.section("Structure libraries"))
+                choices += [
+                    (f"{info['name']}  ({info['structure_count']} structures)", ("open", structure_id))
+                    for structure_id, info in sets
+                ]
+            choices.append(ui.section("Actions"))
             choices.append(("＋ Generate new structure library", ("new", None)))
             choices.append(("📊 Results & Reports", ("reports", None)))
             choices.append(("✕ Exit", ("exit", None)))
