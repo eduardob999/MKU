@@ -265,12 +265,15 @@ def benchmark_thread_plan(
     available_mem_mb: int | None = None,
     operation: str = "opt",
     job_label: str = "nitrobenzene",
+    preopt: str = "winner",
 ) -> list[int]:
     key = benchmark_key(
+        stage="threads",
         cores=detected_cores,
         available_mem_mb=available_mem_mb,
         operation=operation,
         job_label=job_label,
+        preopt=preopt,
     )
     cached = get_cached_best_threads(key)
     if cached and 1 <= cached <= detected_cores:
@@ -288,12 +291,15 @@ def default_threads_after_benchmark(
     available_mem_mb: int | None = None,
     operation: str = "opt",
     job_label: str = "nitrobenzene",
+    preopt: str = "winner",
 ) -> int:
     key = benchmark_key(
+        stage="threads",
         cores=detected_cores,
         available_mem_mb=available_mem_mb,
         operation=operation,
         job_label=job_label,
+        preopt=preopt,
     )
     cached = get_cached_best_threads(key)
     if cached and 1 <= cached <= detected_cores:

@@ -135,9 +135,13 @@ def _run_preopt_benchmark(benchmark_dir: Path, benchmark_sdf: Path, mem: str, np
         {"label": "6-31G preopt", "mode": "gjf-6-31G*"},
     ]
 
+    dft_root = benchmark_dir / "preopt_dft"
+
     rows = []
     for scenario in scenarios:
+        # 1. Produce the (pre)optimized geometry, timing only the preopt step.
         start = time.perf_counter()
+        preopt_ok = True
         if scenario["mode"] == "none":
             sdf_for_dft = str(benchmark_sdf)
         elif scenario["mode"] == "pm7":
@@ -151,6 +155,7 @@ def _run_preopt_benchmark(benchmark_dir: Path, benchmark_sdf: Path, mem: str, np
                 mem=mem,
                 cid="nitrobenzene",
             )
+            preopt_ok = bool(sdf_for_dft) and Path(sdf_for_dft).exists()
         else:
             preopt_work = preopt_dir / "gaussian_631g"
             preopt_work.mkdir(parents=True, exist_ok=True)
@@ -165,26 +170,75 @@ def _run_preopt_benchmark(benchmark_dir: Path, benchmark_sdf: Path, mem: str, np
                 mem=mem,
             )
             sdf_for_dft = str(benchmark_sdf)
-            if preopt_result and preopt_result.success:
+            preopt_ok = bool(preopt_result and preopt_result.success)
+            if preopt_ok:
                 xyz_path = g16.log_to_xyz(preopt_result.log_path)
                 try:
                     out_sdf = preopt_work / "nitrobenzene_631g_preopt.sdf"
-                    gp._xyz_to_sdf(xyz_path, str(out_sdf), template_sdf=str(benchmark_sdf))
-                    sdf_for_dft = str(out_sdf)
+                    if gp._xyz_to_sdf(xyz_path, str(out_sdf), template_sdf=str(benchmark_sdf)):
+                        sdf_for_dft = str(out_sdf)
+                    else:
+                        preopt_ok = False
                 finally:
                     Path(xyz_path).unlink(missing_ok=True)
 
         preopt_seconds = round(time.perf_counter() - start, 3)
+
+        # 2. Run the SAME production DFT (opt then freq) from that geometry, so
+        #    the comparison reflects how much preopt actually speeds convergence.
+        #    We record wall time AND the number of geometry-optimization cycles.
+        dft_seconds = opt_steps = None
+        dft_ok = False
+        dft_log = ""
+        if preopt_ok:
+            dft_dir = dft_root / scenario["mode"]
+            dft_dir.mkdir(parents=True, exist_ok=True)
+            dft_start = time.perf_counter()
+            dft_result = g16.run_compound(
+                sdf_path=sdf_for_dft,
+                work_dir=str(dft_dir),
+                g16_exec="g16",
+                operation="opt then freq",
+                nproc=nproc,
+                mem=mem,
+            )
+            dft_seconds = round(time.perf_counter() - dft_start, 3)
+            dft_ok = bool(dft_result and dft_result.success)
+            dft_log = dft_result.log_path if dft_result else ""
+            if dft_result and dft_result.opt_steps:
+                opt_steps = dft_result.opt_steps[-1].step
+
+        total_seconds = (
+            round(preopt_seconds + dft_seconds, 3) if dft_seconds is not None else None
+        )
         rows.append({
             "scenario": scenario["label"],
             "preopt_mode": scenario["mode"],
             "preopt_seconds": preopt_seconds,
+            "dft_seconds": dft_seconds,
+            "total_seconds": total_seconds,
+            "opt_steps": opt_steps,
             "sdf_for_dft": sdf_for_dft,
-            "success": True,
+            "dft_log": dft_log,
+            "success": bool(preopt_ok and dft_ok),
         })
 
     _write_stage_report(benchmark_dir, "preopt_benchmark.csv", rows)
     return rows
+
+
+def _best_preopt_row(rows):
+    """Pick the preopt mode with the lowest TOTAL (preopt + DFT) wall time.
+
+    Falls back to ``preopt_seconds`` for legacy rows that predate the DFT
+    measurement, and prefers rows that actually succeeded.
+    """
+    def key(row):
+        total = row.get("total_seconds")
+        return total if total is not None else row.get("preopt_seconds", float("inf"))
+
+    usable = [r for r in rows if r.get("success") and r.get("total_seconds") is not None]
+    return min(usable or rows, key=key)
 
 
 def _run_cpu_benchmark(benchmark_dir: Path, preopt_row: dict, threads: list[int], mem: str):
@@ -426,12 +480,38 @@ def run_gaussian_pipeline(model_id, sdf_dir, operation):
     preopt_rows = hardware.get_cached_benchmark_rows(benchmark_preopt_key)
     cpu_rows = hardware.get_cached_benchmark_rows(benchmark_cpu_key)
 
+    # Discard cached preopt rows from before the DFT measurement was added — they
+    # only timed the preopt step, which can't answer whether preopt helps.
+    if preopt_rows is not None and not all("total_seconds" in r for r in preopt_rows):
+        preopt_rows = None
+
     if preopt_rows is None:
         preopt_rows = _run_preopt_benchmark(benchmark_dir, benchmark_sdf, mem, plan.nproc)
-        best_preopt_row = min(preopt_rows, key=lambda row: row["preopt_seconds"])
+        best_preopt_row = _best_preopt_row(preopt_rows)
         hardware.store_benchmark_result(benchmark_preopt_key, preopt_rows, best_preopt_row["preopt_mode"])
     else:
-        best_preopt_row = min(preopt_rows, key=lambda row: row["preopt_seconds"])
+        best_preopt_row = _best_preopt_row(preopt_rows)
+
+    # Show the preopt comparison so "is preopt worth it?" is answerable at a glance:
+    # total wall time (preopt + DFT) and the number of DFT optimization cycles.
+    comparison = []
+    for row in sorted(preopt_rows, key=lambda r: (r.get("total_seconds") is None,
+                                                  r.get("total_seconds") or 0)):
+        steps = row.get("opt_steps")
+        comparison.append((
+            row["preopt_mode"] + (" ★" if row is best_preopt_row else ""),
+            f"{row.get('preopt_seconds', 0):.1f}",
+            f"{row['dft_seconds']:.1f}" if row.get("dft_seconds") is not None else "—",
+            f"{row['total_seconds']:.1f}" if row.get("total_seconds") is not None else "—",
+            steps if steps is not None else "—",
+            "ok" if row.get("success") else "FAILED",
+        ))
+    ui.table(
+        [("Preopt", "white"), ("Preopt s", "muted"), ("DFT s", "muted"),
+         ("Total s", "accent"), ("Opt steps", "muted"), ("Status", "muted")],
+        comparison,
+        title="Preopt comparison (winner ★ = lowest total time)",
+    )
     if cpu_rows is None:
         benchmark_threads = hardware.benchmark_thread_plan(
             plan.cores,
@@ -470,7 +550,7 @@ def run_gaussian_pipeline(model_id, sdf_dir, operation):
         f"Parallel jobs  : {jobs}\n"
         f"Memory per job : {mem}",
         title="Gaussian configuration (from benchmarks)",
-        border_style="info",
+        border_style="accent",
     )
 
     results = batch_run(

@@ -837,7 +837,6 @@ def gaussian_semiempirical_preopt(
     ok, err = g16.run_gaussian(
         gjf_path, log_path,
         g16_exec=g16_exec,
-        scratch_dir=scratch_dir,
     )
 
     if not ok or not g16.check_normal_termination(log_path):
@@ -1276,23 +1275,28 @@ def batch_run(
             results.append(result)
             _record(result)
     else:
-        with ProcessPoolExecutor(max_workers=jobs) as pool:
-            futures = {
-                pool.submit(g16.run_compound, str(sdf), str(work_dir), **kwargs): sdf
-                for sdf in pending
-            }
-            for i, future in enumerate(as_completed(futures), 1):
-                sdf = futures[future]
-                try:
-                    result = future.result()
-                except Exception as exc:
-                    result = g16.RunResult(
-                        cid=sdf.stem, sdf_path=str(sdf), gjf_path="",
-                        log_path="", success=False, error_msg=str(exc),
-                    )
-                print(f"[{i}/{len(pending)}] {sdf.name}", flush=True)
-                results.append(result)
-                _record(result)
+        try:
+            with ProcessPoolExecutor(max_workers=jobs) as pool:
+                futures = {
+                    pool.submit(g16.run_compound, str(sdf), str(work_dir), **kwargs): sdf
+                    for sdf in pending
+                }
+                for i, future in enumerate(as_completed(futures), 1):
+                    sdf = futures[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        result = g16.RunResult(
+                            cid=sdf.stem, sdf_path=str(sdf), gjf_path="",
+                            log_path="", success=False, error_msg=str(exc),
+                        )
+                    print(f"[{i}/{len(pending)}] {sdf.name}", flush=True)
+                    results.append(result)
+                    _record(result)
+        except KeyboardInterrupt:
+            print("\n[SIGINT] Cancelling pending jobs and cleaning up…", flush=True)
+            pool.shutdown(wait=False)
+            raise
 
     ok = sum(1 for r in results if r.success)
     print(f"Batch complete: {ok}/{len(results)} succeeded "
