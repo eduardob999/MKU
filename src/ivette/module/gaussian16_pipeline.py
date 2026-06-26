@@ -1250,6 +1250,7 @@ def batch_run(
     multiplicity: int = 1,
     cosmo: bool = False,
     timeout: Optional[int] = None,
+    extra_keywords: str = "",
 ) -> "list[g16.RunResult]":
     """Run the Gaussian pipeline over every ``*.sdf`` in ``sdf_dir``.
 
@@ -1291,7 +1292,7 @@ def batch_run(
         g16_exec=g16_exec, basis_set=basis_set, method=method, operation=operation,
         preopt_mode=preopt_mode, preopt_basis_set=preopt_basis_set,
         charge=charge, multiplicity=multiplicity, nproc=nproc, mem=mem,
-        cosmo=cosmo, timeout=timeout,
+        cosmo=cosmo, timeout=timeout, extra_keywords=extra_keywords,
     )
 
     def _record(result, seconds):

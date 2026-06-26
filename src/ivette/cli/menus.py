@@ -7,6 +7,7 @@ questionary); persistence lives in :mod:`ivette.util.storage`; session state in
 stays fixed in place.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -23,7 +24,6 @@ from ivette.cli import ui
 from ivette.cli.context import context, render_header
 from ivette.util import applog
 from ivette.util import hardware
-from ivette.util import jsonstore
 from ivette.util.paths import GAUSSIAN_BENCHMARK_RUN_DIR
 from ivette.module import gaussian16_core as g16
 from ivette.util.text import slugify
@@ -62,13 +62,14 @@ from ivette.core.download_physchem import (
     fetch_properties_for_cids,
     is_nitro_zwitterion,
     interleave_rows,
-    DEFAULT_PROPERTIES,
 )
 from ivette.core.find_thermo import main as find_thermo_main
 from ivette.core.train_pipeline import main as train_pipeline_main
 from ivette.core.download_training_sdfs import main as download_training_sdfs_main
 from ivette.core.parse_dft import parse_geometry_descriptors
 from ivette.core.dft_feature_test import compare_target_with_dft
+from ivette.core import params as P
+from ivette.cli.params_ui import configure_stage
 
 
 def _df_table(df, *, title=None, max_rows=20):
@@ -486,14 +487,18 @@ def run_gaussian_pipeline(model_id, geometry_dir, operation, *, cosmo=False, cha
         title="Gaussian pipeline",
     )
 
+    # Advanced options: functional, basis set, preopt override, timeout, extra
+    # route keywords (+ presets). preopt_mode "auto" defers to the benchmark.
+    gp = configure_stage("gaussian")
+
     # Bring up the live dashboard so benchmark, convergence and batch-progress
     # plots are on screen as the run proceeds.
     _ensure_control_room()
 
-    # batch_run lives in the full Gaussian pipeline, which is imported lazily so
-    # the rest of the CLI stays usable when that pipeline isn't available.
+    # The headless Gaussian service (and the pipeline it wraps) is imported
+    # lazily so the rest of the CLI stays usable when that pipeline isn't available.
     try:
-        from ivette.module.gaussian16_pipeline import batch_run
+        from ivette.services.gaussian import run_charge_state_batches
     except ImportError as exc:
         ui.error(f"Gaussian pipeline unavailable: {exc}")
         ui.pause()
@@ -601,6 +606,11 @@ def run_gaussian_pipeline(model_id, geometry_dir, operation, *, cosmo=False, cha
         preopt_mode = "gaussian631g"
         preopt_basis_set = "6-31G*"
 
+    # Advanced override: a non-"auto" preopt choice wins over the benchmark.
+    if gp.preopt_mode != "auto":
+        preopt_mode = gp.preopt_mode
+        ui.note(f"Preopt overridden by advanced options: {preopt_mode}")
+
     ui.panel(
         f"Preopt method  : {best_preopt_row['preopt_mode']} ({best_preopt_row['preopt_seconds']:.3f}s)\n"
         f"Cores per job  : {nproc} threads\n"
@@ -611,62 +621,53 @@ def run_gaussian_pipeline(model_id, geometry_dir, operation, *, cosmo=False, cha
         border_style="accent",
     )
 
-    # Production batch — once per requested charge state, all sharing the single
-    # benchmark above. Each state writes to its own subdirectory + checkpoint and
-    # gets independent overwrite/resume protection.
-    for label, charge, multiplicity in charge_states:
-        work_dir = (gaussian_root / label) if label else gaussian_root
-        work_dir.mkdir(parents=True, exist_ok=True)
-        checkpoint = work_dir / "checkpoint.json"
-        state_name = label or "neutral"
-        ui.rule(f"{operation} — {state_name} (charge {charge}, multiplicity {multiplicity})")
-
-        # Overwrite protection: a previous run for this state reuses the same
-        # directory. Ask before touching it.
-        resume = True
-        done = jsonstore.read_json(checkpoint, default={}) if checkpoint.exists() else {}
-        n_done = sum(1 for v in done.values() if isinstance(v, dict) and v.get("success"))
-        if done or any(work_dir.glob("*/*.log")):
-            choice = ui.select(
-                f"Existing {state_name} results found ({operation}"
-                f"{' + COSMO' if cosmo else ''}) — {n_done} molecule(s) already completed.",
-                [
-                    ("Resume — keep completed molecules, run only the rest", "resume"),
-                    ("Restart — delete these results and recompute everything", "restart"),
-                    ("Skip this charge state", "skip"),
-                ],
-            )
-            if choice is ui.CANCEL or choice == "skip":
-                ui.note(f"Skipped {state_name} — no data changed.")
-                continue
-            if choice == "restart":
-                shutil.rmtree(work_dir, ignore_errors=True)
-                work_dir.mkdir(parents=True, exist_ok=True)
-                resume = False
-
-        results = batch_run(
-            sdf_dir=str(geometry_dir),
-            work_dir=str(work_dir),
-            jobs=jobs,
-            operation=operation,
-            resume=resume,
-            checkpoint=str(checkpoint),
-            nproc=nproc,
-            mem=mem,
-            preopt_mode=preopt_mode,
-            preopt_basis_set=preopt_basis_set,
-            cosmo=cosmo,
-            charge=charge,
-            multiplicity=multiplicity,
+    # Production batch — the headless service runs one batch per charge state,
+    # all sharing the single benchmark above. The UI is supplied as callbacks:
+    # the overwrite decision and the progress display below are the only parts
+    # that know about the terminal; the orchestration itself is UI-free.
+    def _decide_existing(state_name, n_existing):
+        choice = ui.select(
+            f"Existing {state_name} results found ({operation}"
+            f"{' + COSMO' if cosmo else ''}) — {n_existing} molecule(s) already completed.",
+            [
+                ("Resume — keep completed molecules, run only the rest", "resume"),
+                ("Restart — delete these results and recompute everything", "restart"),
+                ("Skip this charge state", "skip"),
+            ],
         )
+        return "skip" if choice is ui.CANCEL else choice
 
-        success = sum(r.success for r in results)
-        failed = len(results) - success
+    def _on_state_start(state):
+        ui.rule(f"{operation} — {state.state_name} "
+                f"(charge {state.charge}, multiplicity {state.multiplicity})")
+
+    def _on_state_done(state):
+        if state.skipped:
+            ui.note(f"Skipped {state.state_name} — no data changed.")
+            return
         ui.panel(
-            f"[success]Successful:[/success] {success}\n[error]Failed:[/error] {failed}",
-            title=f"Gaussian finished — {state_name}",
-            border_style="success" if failed == 0 else "warn",
+            f"[success]Successful:[/success] {state.n_success}\n"
+            f"[error]Failed:[/error] {state.n_failed}",
+            title=f"Gaussian finished — {state.state_name}",
+            border_style="success" if state.n_failed == 0 else "warn",
         )
+
+    run_charge_state_batches(
+        geometry_dir,
+        gaussian_root,
+        operation=operation,
+        cosmo=cosmo,
+        charge_states=charge_states,
+        batch_settings=dict(
+            jobs=jobs, nproc=nproc, mem=mem,
+            preopt_mode=preopt_mode, preopt_basis_set=preopt_basis_set,
+            method=gp.method, basis_set=gp.basis_set,
+            timeout=(gp.timeout or None), extra_keywords=gp.extra_keywords,
+        ),
+        decide_existing=_decide_existing,
+        on_state_start=_on_state_start,
+        on_state_done=_on_state_done,
+    )
     ui.pause()
 
 
@@ -686,8 +687,9 @@ def generate_structure_library_menu():
         ui.pause()
         return
 
+    sp = configure_stage("structures")
     with ui.status("Generating structures…"):
-        structure_set = generate_structures(ring_sizes=(5, 6))
+        structure_set = generate_structures(ring_sizes=tuple(sp.ring_sizes))
     structure_id = save_structure_library(structure_set, name)
 
     ui.success(
@@ -730,16 +732,12 @@ def download_compound_library_menu(structure_id, df):
     smiles_list = df[smiles_col].dropna().unique().tolist()
     ui.info(f"{len(smiles_list)} unique SMILES will be used as substructure queries.")
 
-    max_records = ui.ask_int("Max records per substructure", 500)
-
-    if ui.confirm(f"Use default properties? ({', '.join(DEFAULT_PROPERTIES)})", default=True):
-        properties = list(DEFAULT_PROPERTIES)
-    else:
-        raw_props = ui.ask_text("Property names (space-separated)")
-        properties = raw_props.split() if raw_props else list(DEFAULT_PROPERTIES)
-
-    batch_size = ui.ask_int("CIDs per fetch batch", 100)
-    sleep = ui.ask_float("Sleep between requests (s)", 0.2)
+    # Advanced options: max records, properties, batch size, request sleep (+ presets).
+    dp = configure_stage("download")
+    max_records = dp.max_records
+    properties = dp.properties
+    batch_size = dp.batch_size
+    sleep = dp.sleep
 
     render_header()
     ui.table(
@@ -856,7 +854,15 @@ def generate_model_menu(dataset_id):
         ui.pause()
         return
 
-    parameters = {"radius": 2, "nbits": 512, "source_dataset": str(input_file)}
+    # Advanced options: fingerprint + XGBoost hyperparameters, with presets.
+    tp = configure_stage("training")
+    params_json = output_dir / "training_params.json"
+    params_json.write_text(json.dumps(P.to_dict(tp), indent=2))
+
+    parameters = {
+        "radius": tp.radius, "nbits": tp.nbits,
+        "training": P.to_dict(tp), "source_dataset": str(input_file),
+    }
     register_model(dataset_id, name, parameters, output_dir)
 
     _ensure_control_room()   # model CV-R² panel updates when training finishes
@@ -865,8 +871,7 @@ def generate_model_menu(dataset_id):
         "--input", str(input_file),
         "--models-dir", str(output_dir),
         "--workdir", str(output_dir),  # keep training intermediates inside the model dir
-        "--radius", str(parameters["radius"]),
-        "--nbits", str(parameters["nbits"]),
+        "--params-json", str(params_json),
     ]
     try:
         train_pipeline_main(argv)
@@ -1275,26 +1280,6 @@ def preview_dataset_output(dataset_id):
 
 
 # ============================================================
-# Property dataset parameter prompts
-# ============================================================
-
-def prompt_dataset_parameters():
-    ui.rule("Run parameters")
-    return {
-        "max_compounds": ui.ask_int("Max compounds to process (0 = all)", 0),
-        "pubmed_max": ui.ask_int("Max PubMed results per compound", 20),
-        "fetch_pharma": ui.confirm(
-            "Fetch pharmacology data (PubChem / ChEMBL / BindingDB)?", default=False),
-        "pubchem_max_aids": ui.ask_int("Max PubChem bioassay AIDs per compound", 10),
-        "chembl_activity_limit": ui.ask_int("Max ChEMBL activities per compound", 100),
-        "chembl_max_pages": ui.ask_int("Max ChEMBL pages per compound", 5),
-        "merge_pharma": ui.confirm("Merge pharmacology into wide output?", default=False),
-        "wide_from_clean": ui.confirm(
-            "Build wide output via clean_thermo pipeline?", default=True),
-    }
-
-
-# ============================================================
 # Property dataset menus
 # ============================================================
 
@@ -1310,7 +1295,9 @@ def new_dataset_menu(compound_id):
         ui.pause()
         return
 
-    params = prompt_dataset_parameters()
+    # Advanced options: compound cap, PubMed/PubChem/ChEMBL limits, pharma
+    # toggles (+ presets). Returned as a plain dict for the rest of the flow.
+    params = P.to_dict(configure_stage("dataset"))
 
     # Reserve output directory using the prospective run ID.
     provisional_id = DATASETS.next_id()

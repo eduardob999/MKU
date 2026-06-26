@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import KFold, cross_val_score
 
 from ivette.core.train_xgboost_emfp import (
     MIN_SAMPLES,
@@ -18,13 +17,12 @@ from ivette.core.train_xgboost_emfp import (
     classify_columns,
     generate_emfp_dataframe,
 )
-
-
-def _cv_r2(model_factory, X, y, n):
-    folds = min(5, max(3, n // 10))
-    cv = KFold(n_splits=folds, shuffle=True, random_state=42)
-    scores = cross_val_score(model_factory(), X, y, cv=cv, scoring="r2", n_jobs=-1)
-    return float(np.mean(scores)), float(np.std(scores)), folds
+from ivette.core.modeling import (
+    apply_transform,
+    cv_r2,
+    decide_transform,
+    scaffold_groups,
+)
 
 
 def compare_target_with_dft(source, target, dft_df, *,
@@ -47,7 +45,10 @@ def compare_target_with_dft(source, target, dft_df, *,
     if n < MIN_SAMPLES:
         return {"error": f"only {n} samples (need >= {MIN_SAMPLES})", "n_samples": n}
 
-    y = np.log10(pd.to_numeric(sub[target], errors="coerce").clip(lower=1e-12)).values
+    # Per-target transform (log only positive, wide-range targets) — never a
+    # blind log10 that would destroy signed properties.
+    transform = decide_transform(sub[target])
+    y = apply_transform(sub[target], transform)
 
     # base features: physchem descriptors + eMFP fingerprints
     fp = generate_emfp_dataframe(sub[smiles_col], radius=radius, nbits=nbits)
@@ -65,8 +66,11 @@ def compare_target_with_dft(source, target, dft_df, *,
     n_covered = int(joined.notna().any(axis=1).sum())
     augmented = pd.concat([base.reset_index(drop=True), joined], axis=1)
 
-    base_r2, base_std, folds = _cv_r2(build_model, base, y, n)
-    aug_r2, aug_std, _ = _cv_r2(build_model, augmented, y, n)
+    # Same scaffold-grouped folds for both models so the comparison is fair and
+    # not inflated by analog leakage.
+    groups = scaffold_groups(sub[smiles_col])
+    base_r2, base_std, folds, cv_method = cv_r2(build_model, base, y, groups)
+    aug_r2, aug_std, _, _ = cv_r2(build_model, augmented, y, groups)
 
     # importance share of the DFT block in the augmented model
     model = build_model()
@@ -78,6 +82,8 @@ def compare_target_with_dft(source, target, dft_df, *,
         "target": target,
         "n_samples": n,
         "n_dft_covered": n_covered,
+        "transform": transform,
+        "cv_method": cv_method,
         "cv_folds": folds,
         "baseline_cv_r2": base_r2,
         "baseline_cv_std": base_std,

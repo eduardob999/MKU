@@ -658,6 +658,7 @@ def run_compound(
     mem:         str   = "4GB",
     cosmo:       bool  = False,
     timeout:     Optional[int] = None,
+    extra_keywords: str = "",
 ) -> RunResult:
     """
     Full pipeline for one compound:
@@ -762,6 +763,7 @@ def run_compound(
                 charge=charge, multiplicity=multiplicity,
                 nproc=nproc, mem=mem, cosmo=cosmo,
                 title=f"CID {cid} (opt)",
+                extra_keywords=extra_keywords,
             )
         except Exception as exc:
             return RunResult(
@@ -788,6 +790,7 @@ def run_compound(
                 charge=charge, multiplicity=multiplicity,
                 nproc=nproc, mem=mem, cosmo=cosmo,
                 title=f"CID {cid} (freq)",
+                extra_keywords=extra_keywords,
             )
         except Exception as exc:
             Path(temp_xyz).unlink(missing_ok=True)
@@ -824,6 +827,7 @@ def run_compound(
             charge=charge, multiplicity=multiplicity,
             nproc=nproc, mem=mem, cosmo=cosmo,
             title=f"CID {cid}",
+            extra_keywords=extra_keywords,
         )
     except Exception as exc:
         return RunResult(

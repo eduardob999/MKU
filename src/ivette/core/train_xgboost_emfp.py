@@ -27,7 +27,6 @@ import pandas as pd
 from rdkit import Chem
 from rdkit.Chem import rdFingerprintGenerator
 
-from sklearn.model_selection import KFold, cross_val_score
 from sklearn.metrics import (
     mean_absolute_error,
     mean_squared_error,
@@ -38,6 +37,12 @@ from xgboost import XGBRegressor
 
 from ivette.util.columns import is_target_column
 from ivette.util.text import slugify
+from ivette.core.modeling import (
+    apply_transform,
+    cv_r2,
+    decide_transform,
+    scaffold_groups,
+)
 
 
 # ============================================================
@@ -153,14 +158,17 @@ def generate_emfp_dataframe(
 # Model
 # ============================================================
 
-def build_model():
+def build_model(tp=None):
+    """Build the XGBoost regressor from a :class:`TrainingParams` (or defaults)."""
+    from ivette.core.params import TrainingParams
 
+    tp = tp or TrainingParams()
     return XGBRegressor(
-        n_estimators=500,
-        max_depth=5,
-        learning_rate=0.03,
-        subsample=0.8,
-        colsample_bytree=0.8,
+        n_estimators=tp.n_estimators,
+        max_depth=tp.max_depth,
+        learning_rate=tp.learning_rate,
+        subsample=tp.subsample,
+        colsample_bytree=tp.colsample_bytree,
         objective="reg:squarederror",
         random_state=42,
         n_jobs=-1,
@@ -175,10 +183,23 @@ def build_model():
 def train_target(
     df,
     target_col,
-    feature_columns
+    feature_columns,
+    smiles_col="SMILES",
+    model_factory=None,
+    tp=None,
 ):
+    # ``tp`` (TrainingParams) drives hyperparameters + CV/transform thresholds.
+    # ``model_factory`` overrides estimator construction when given (e.g. a
+    # small/fast model in tests); otherwise it is built from ``tp``.
+    from ivette.core.params import TrainingParams
 
-    cols = feature_columns + [target_col]
+    tp = tp or TrainingParams()
+    if model_factory is None:
+        model_factory = lambda: build_model(tp)
+
+    # Keep SMILES alongside the features/target so we can scaffold-group the CV;
+    # it is never used as a model input.
+    cols = list(dict.fromkeys(feature_columns + [target_col, smiles_col]))
 
     subset = df[cols].copy()
 
@@ -188,38 +209,26 @@ def train_target(
 
     n = len(subset)
 
-    if n < MIN_SAMPLES:
+    if n < tp.min_samples:
         return None
 
     X = subset[feature_columns]
 
-    y = subset[target_col]
+    y_raw = subset[target_col]
 
-    y = np.log10(
-        y.clip(lower=1e-12)
-    )
+    # Per-target transform: log only positive, wide-dynamic-range targets;
+    # signed properties (logP, enthalpies, energies) stay linear.
+    transform = decide_transform(y_raw, min_samples=tp.min_samples,
+                                 dynamic_range=tp.log_dynamic_range)
+    y = apply_transform(y_raw, transform)
 
-    model = build_model()
+    # Scaffold-grouped CV so close analogs don't leak across folds.
+    groups = scaffold_groups(subset[smiles_col])
 
-    folds = min(
-        5,
-        max(3, n // 10)
-    )
+    model = model_factory()
 
-    cv = KFold(
-        n_splits=folds,
-        shuffle=True,
-        random_state=42
-    )
-
-    r2_scores = cross_val_score(
-        model,
-        X,
-        y,
-        cv=cv,
-        scoring="r2",
-        n_jobs=-1
-    )
+    cv_mean, cv_std, folds, cv_method = cv_r2(model_factory, X, y, groups,
+                                              max_folds=tp.cv_max_folds)
 
     model.fit(X, y)
 
@@ -228,8 +237,11 @@ def train_target(
     report = {
         "target": target_col,
         "n_samples": int(n),
-        "cv_r2_mean": float(np.mean(r2_scores)),
-        "cv_r2_std": float(np.std(r2_scores)),
+        "transform": transform,
+        "cv_method": cv_method,
+        "cv_folds": int(folds),
+        "cv_r2_mean": float(cv_mean),
+        "cv_r2_std": float(cv_std),
         "train_r2": float(
             r2_score(y, pred)
         ),
@@ -293,7 +305,25 @@ def main(argv=None):
         default="SMILES"
     )
 
+    parser.add_argument(
+        "--params-json",
+        default=None,
+        help="JSON file of TrainingParams (radius, nbits, hyperparameters, …). "
+             "Overrides --radius/--nbits when given.",
+    )
+
     args = parser.parse_args(argv)
+
+    # Training configuration: a params JSON (from the UI) is the full source of
+    # truth; otherwise fall back to --radius/--nbits with documented defaults.
+    from ivette.core.params import TrainingParams, from_dict
+    if args.params_json:
+        tp = from_dict(TrainingParams, json.load(open(args.params_json)))
+    else:
+        tp = TrainingParams(radius=args.radius, nbits=args.nbits)
+    print(f"Training params: radius={tp.radius} nbits={tp.nbits} "
+          f"n_estimators={tp.n_estimators} max_depth={tp.max_depth} "
+          f"lr={tp.learning_rate} min_samples={tp.min_samples}")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -324,8 +354,8 @@ def main(argv=None):
 
     fp_df = generate_emfp_dataframe(
         df[args.smiles_col],
-        radius=args.radius,
-        nbits=args.nbits
+        radius=tp.radius,
+        nbits=tp.nbits
     )
 
     df = pd.concat(
@@ -355,7 +385,9 @@ def main(argv=None):
         result = train_target(
             df,
             target,
-            available_features
+            available_features,
+            smiles_col=args.smiles_col,
+            tp=tp,
         )
 
         if result is None:

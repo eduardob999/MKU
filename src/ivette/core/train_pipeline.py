@@ -42,6 +42,12 @@ def main(argv=None):
         default=1024
     )
 
+    parser.add_argument(
+        "--params-json",
+        default=None,
+        help="JSON file of TrainingParams forwarded to the trainer."
+    )
+
     args = parser.parse_args(argv)
 
 
@@ -211,21 +217,24 @@ def main(argv=None):
     )
 
 
-    train_xgboost_main(
-        [
-            "--input",
-            str(merged_file),
+    train_argv = [
+        "--input",
+        str(merged_file),
 
-            "--output-dir",
-            str(models_dir),
+        "--output-dir",
+        str(models_dir),
 
-            "--radius",
-            str(args.radius),
+        "--radius",
+        str(args.radius),
 
-            "--nbits",
-            str(args.nbits)
-        ]
-    )
+        "--nbits",
+        str(args.nbits),
+    ]
+
+    if args.params_json:
+        train_argv += ["--params-json", args.params_json]
+
+    train_xgboost_main(train_argv)
 
 
     print(
