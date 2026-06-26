@@ -18,6 +18,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--fetch-pharma", action="store_true", default=True)
     p.add_argument("--pharma-output", default=export_path("pharma_parsed.csv"))
 
+    # PubMed literature mining: opt-in, requires IVETTE_PUBMED_API_KEY at runtime.
+    p.add_argument("--fetch-pubmed", action="store_true", default=False)
+
     p.add_argument("--merge-pharma", action="store_true", default=True)
     p.add_argument("--merged-pharma-output", default=export_path("thermo_pharma_merged.csv"))
 
@@ -27,6 +30,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--summary-output", default=export_path("thermo_summary.csv"))
     p.add_argument("--ml-output", default=export_path("thermo_ml.csv"))
     p.add_argument("--rare-output", default=export_path("rare_properties.csv"))
+    p.add_argument("--sparse-output", default=export_path("thermo_ml_sparse.csv"),
+                   help="Near-empty (rare) property columns, preserved out of the training table")
     p.add_argument("--cleaning-report", default=export_path("cleaning_report.txt"))
     p.add_argument("--timing-log", default=log_path("timing_log.txt"),
                    help="Per-run timing log (default: data/logs/timing_log.txt)")

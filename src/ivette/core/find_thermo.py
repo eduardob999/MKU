@@ -8,13 +8,14 @@ import time
 
 from ivette.util import http
 from ivette.util import applog
+from ivette.util.paths import export_path
 from ivette.util.csvio import write_csv
 from ivette.util.timing import TimingLog
 from ivette.module.cli import build_arg_parser, interactive_parameter_menu
 from ivette.module.nist_client import check_nist_entry
 from ivette.module.nist_parser import extract_nist_section_links, extract_nist_property_rows
 from ivette.module.pubchem_client import get_pubchem_details, fetch_pubchem_property_rows
-from ivette.module.pubmed_client import analyze_pubmed
+from ivette.module.pubmed_client import analyze_pubmed, empty_pubmed_result
 from ivette.module.wide_output import build_wide_output, merge_pharma_into_wide, strip_property_value_unit, write_values_only_wide
 from ivette.module.pharma_fetchers import fetch_pubchem_bioassays, fetch_chembl_activities_by_inchikey, fetch_bindingdb_activities_by_inchikey
 
@@ -65,7 +66,8 @@ def validate_parsed_csv(path: str) -> None:
         raise SystemExit(f"Error: '{path}' has no data rows.")
 
 
-def run_cleaning_pipeline(parsed_input, cleaned_output, summary_output, ml_output, rare_output, report_output):
+def run_cleaning_pipeline(parsed_input, cleaned_output, summary_output, ml_output,
+                         rare_output, report_output, sparse_output):
     script_path = os.path.join(os.path.dirname(__file__), "clean_thermo.py")
     if not os.path.exists(script_path):
         raise FileNotFoundError(f"clean_thermo.py not found at {script_path}")
@@ -75,6 +77,7 @@ def run_cleaning_pipeline(parsed_input, cleaned_output, summary_output, ml_outpu
         "--summary-output", summary_output,
         "--ml-output", ml_output,
         "--rare-output", rare_output,
+        "--sparse-output", sparse_output,
         "--report-output", report_output,
     ], check=True)
 
@@ -91,6 +94,17 @@ def main(argv=None):
              args.input, args.max, getattr(args, "fetch_pharma", None))
     tlog = TimingLog(timing_log_path)
 
+    # PubMed is an opt-in, API-key-gated path (scaffold for future article/AI
+    # extraction). Off by default; enabling it without a key is a no-op so the
+    # default run never makes the per-compound Entrez calls.
+    pubmed_enabled = getattr(args, "fetch_pubmed", False)
+    pubmed_api_key = os.environ.get("IVETTE_PUBMED_API_KEY", "")
+    if pubmed_enabled and not pubmed_api_key:
+        log.warning("PubMed requested but IVETTE_PUBMED_API_KEY is unset — skipping PubMed.")
+        print("Warning: --fetch-pubmed set but IVETTE_PUBMED_API_KEY is not set; "
+              "skipping PubMed.", file=sys.stderr)
+        pubmed_enabled = False
+
     if not os.path.exists(args.input):
         raise SystemExit(f"Error: input file '{args.input}' does not exist.")
 
@@ -98,7 +112,7 @@ def main(argv=None):
         reader = csv.DictReader(fh)
         rows = [row for i, row in enumerate(reader) if not args.max or i < args.max]
 
-    report, available, parsed_rows, pharma_rows = [], [], [], []
+    report, parsed_rows, pharma_rows = [], [], []
 
     for r in rows:
         cid = r.get("CID") or r.get("cid") or ""
@@ -118,7 +132,11 @@ def main(argv=None):
         tlog.record(f"CID={cid}  NIST lookup", time.perf_counter() - t0)
 
         t0 = time.perf_counter()
-        pubmed = analyze_pubmed(name or inchikey, max_results=args.pubmed_max)
+        if pubmed_enabled:
+            pubmed = analyze_pubmed(name or inchikey, max_results=args.pubmed_max,
+                                    api_key=pubmed_api_key)
+        else:
+            pubmed = empty_pubmed_result()
         tlog.record(f"CID={cid}  PubMed analysis", time.perf_counter() - t0)
 
         entry = {
@@ -128,8 +146,6 @@ def main(argv=None):
             **pubmed,
         }
         report.append(entry)
-        if entry["NIST_Found"] or entry["PubMed_Abstract_Match_Count"] > 0:
-            available.append(entry)
 
         if args.parsed_output and cid:
             t0 = time.perf_counter()
@@ -168,10 +184,8 @@ def main(argv=None):
 
     t0 = time.perf_counter()
     write_csv(args.output, REPORT_FIELDNAMES, report)
-    write_csv(args.available_output, REPORT_FIELDNAMES, available)
-    tlog.record("Writing report CSVs", time.perf_counter() - t0)
+    tlog.record("Writing report CSV", time.perf_counter() - t0)
     print(f"Wrote report to {args.output}")
-    print(f"Wrote available-data report to {args.available_output}")
 
     if args.parsed_output:
         t0 = time.perf_counter()
@@ -238,6 +252,7 @@ def main(argv=None):
         run_cleaning_pipeline(
             args.parsed_output, args.cleaned_output, args.summary_output,
             args.wide_output, args.rare_output, args.cleaning_report,
+            getattr(args, "sparse_output", export_path("thermo_ml_sparse.csv")),
         )
         tlog.record("Cleaning pipeline (clean_thermo.py)", time.perf_counter() - t0)
         print(f"Cleaned: {args.cleaned_output}, Summary: {args.summary_output}, ML: {args.wide_output}")

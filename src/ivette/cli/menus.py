@@ -1337,13 +1337,13 @@ def new_dataset_menu(compound_id):
     argv = [
         "--input", input_csv,
         "--output", str(output_dir / "report.csv"),
-        "--available-output", str(output_dir / "available.csv"),
         "--parsed-output", str(output_dir / "parsed.csv"),
         "--ml-output", str(output_dir / "wide.csv"),
         "--wide-output", str(output_dir / "wide_clean.csv"),
         "--cleaned-output", str(output_dir / "cleaned.csv"),
         "--summary-output", str(output_dir / "summary.csv"),
         "--rare-output", str(output_dir / "rare.csv"),
+        "--sparse-output", str(output_dir / "sparse.csv"),
         "--cleaning-report", str(output_dir / "cleaning_report.csv"),
         "--pharma-output", str(output_dir / "pharma.csv"),
         "--merged-pharma-output", str(output_dir / "merged_pharma.csv"),
@@ -1357,6 +1357,8 @@ def new_dataset_menu(compound_id):
         argv += ["--max", str(params["max_compounds"])]
     if params["fetch_pharma"]:
         argv.append("--fetch-pharma")
+    if params.get("fetch_pubmed"):
+        argv.append("--fetch-pubmed")
     if params["merge_pharma"]:
         argv.append("--merge-pharma")
     if params["wide_from_clean"]:

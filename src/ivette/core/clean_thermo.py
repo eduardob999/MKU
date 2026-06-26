@@ -128,6 +128,102 @@ SOURCE_PRIORITY = {
     "PubChem": 2,
 }
 
+# Canonical unit per standardized property. Values are converted into this unit
+# BEFORE aggregation so that, e.g., a boiling point reported in °C (PubChem) and
+# in K (NIST) are combined correctly instead of being medianed across units.
+# Properties absent here are unitless (LogP, pKa) or unmanaged — left untouched.
+CANONICAL_UNIT: Dict[str, str] = {
+    "Tm": "K", "Tb": "K",
+    "Hvap": "kJ/mol", "Hfus": "kJ/mol",
+    "Hf_gas": "kJ/mol", "Hf_liq": "kJ/mol", "Hf_sol": "kJ/mol",
+    "PA": "kJ/mol", "GB": "kJ/mol",
+    "IE": "eV", "EA": "eV",
+    "MW": "g/mol", "ExactMass": "g/mol", "MonoMass": "g/mol",
+    "CCS": "A2",
+}
+
+# Conversions keyed by (CleanUnit, canonical_unit). Identity pairs included so a
+# value already in the canonical unit passes through. A (from, to) pair that is
+# absent means the units are incompatible → the value is dropped (can't trust it).
+_UNIT_CONVERSIONS = {
+    ("C", "K"): lambda v: v + 273.15,
+    ("K", "K"): lambda v: v,
+    ("J/mol", "kJ/mol"): lambda v: v / 1000.0,
+    ("kJ/mol", "kJ/mol"): lambda v: v,
+    ("Da", "g/mol"): lambda v: v,
+    ("g/mol", "g/mol"): lambda v: v,
+    ("eV", "eV"): lambda v: v,
+    ("A2", "A2"): lambda v: v,
+}
+
+# Physical plausibility bounds (in canonical units). Values outside [lo, hi] are
+# dropped as misparses. Generous on purpose — only impossible values are removed.
+PHYSICAL_BOUNDS: Dict[str, tuple] = {
+    "MW": (1.0, 2000.0), "ExactMass": (1.0, 2000.0), "MonoMass": (1.0, 2000.0),
+    "Tm": (1.0, 1500.0), "Tb": (1.0, 1500.0),
+    "LogP": (-10.0, 15.0),
+    "Hvap": (0.0, 500.0), "Hfus": (0.0, 300.0),
+    "Hf_gas": (-2000.0, 2000.0), "Hf_liq": (-2000.0, 2000.0), "Hf_sol": (-2000.0, 2000.0),
+    "PA": (0.0, 2000.0), "GB": (0.0, 2000.0),
+    "IE": (1.0, 30.0), "EA": (-10.0, 10.0),
+    "CCS": (10.0, 1000.0),
+    "pKa": (-10.0, 50.0),
+}
+
+
+def to_canonical_value(prop, value, clean_unit):
+    """Convert a measurement into its property's canonical unit.
+
+    Returns the converted value, or ``np.nan`` when the value is missing or its
+    unit is incompatible with the canonical unit. Unitless/unmanaged properties
+    and rows with no unit are returned unchanged (a missing unit is assumed to
+    already be canonical — true for e.g. PubChem molecular weight).
+    """
+    canon = CANONICAL_UNIT.get(prop)
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return np.nan
+    if not canon:
+        return value
+    if not isinstance(clean_unit, str) or not clean_unit.strip():
+        return value
+    fn = _UNIT_CONVERSIONS.get((clean_unit.strip(), canon))
+    return fn(value) if fn is not None else np.nan
+
+
+def add_canonical_values(df: pd.DataFrame) -> pd.DataFrame:
+    """Replace ``NumericValue`` with values converted to each property's canonical
+    unit, and record that unit in ``CanonicalUnit``."""
+    df = df.copy()
+    converted = [
+        to_canonical_value(p, v, u)
+        for p, v, u in zip(df["StandardPropertyName"], df["NumericValue"], df["CleanUnit"])
+    ]
+    df["NumericValue"] = converted
+    df["CanonicalUnit"] = df["StandardPropertyName"].map(CANONICAL_UNIT)
+    return df
+
+
+def apply_physical_bounds(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop rows whose canonical value falls outside its property's plausible range."""
+    keep = pd.Series(True, index=df.index)
+    vals = df["NumericValue"]
+    for prop, (lo, hi) in PHYSICAL_BOUNDS.items():
+        is_prop = df["StandardPropertyName"] == prop
+        out_of_range = is_prop & vals.notna() & ((vals < lo) | (vals > hi))
+        keep &= ~out_of_range
+    return df[keep].copy()
+
+
+def split_by_coverage(df: pd.DataFrame, min_fraction: float):
+    """Partition property names into (frequent, sparse) by unique-compound coverage."""
+    total = df["CID"].nunique() or 1
+    cov = (df.dropna(subset=["StandardPropertyName"])
+             .groupby("StandardPropertyName")["CID"].nunique() / float(total))
+    frequent = set(cov[cov >= min_fraction].index)
+    sparse = set(cov[cov < min_fraction].index)
+    return frequent, sparse
+
+
 URL_REGEX = re.compile(r"^\s*(https?://|www\.)", flags=re.IGNORECASE)
 DB_REF_REGEX = re.compile(r"^\s*[A-Za-z]{1,10}:[^\s]+\s*$")
 
@@ -139,7 +235,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--summary-output", default=export_path("thermo_summary.csv"), help="Compound/property summary statistics")
     parser.add_argument("--ml-output", default=export_path("thermo_ml.csv"), help="Machine learning wide-format dataset")
     parser.add_argument("--rare-output", default=export_path("rare_properties.csv"), help="Rare property frequency export")
+    parser.add_argument("--sparse-output", default=export_path("thermo_ml_sparse.csv"),
+                        help="Wide table of the near-empty (rare) property columns, kept out of training but preserved")
     parser.add_argument("--report-output", default=export_path("cleaning_report.txt"), help="Cleaning report text file")
+    parser.add_argument("--min-coverage", type=float, default=0.005,
+                        help="Properties present in fewer than this fraction of compounds are moved to --sparse-output")
     return parser.parse_args()
 
 
@@ -295,8 +395,16 @@ def generate_summary(df: pd.DataFrame) -> pd.DataFrame:
     return summary
 
 
-def generate_ml_dataset(df: pd.DataFrame) -> pd.DataFrame:
-    """Generate ML-ready wide-format dataset with columns grouped as Median/Count/IQR per property."""
+def generate_ml_dataset(df: pd.DataFrame, include_props=None) -> pd.DataFrame:
+    """Generate ML-ready wide-format dataset with columns grouped as Median/Count/IQR per property.
+
+    ``include_props`` restricts which standardized properties become columns
+    (used to split the frequent/sparse tables); ``None`` keeps all.
+    """
+    if include_props is not None:
+        df = df[df["StandardPropertyName"].isin(include_props)]
+    if df.empty:
+        return pd.DataFrame(columns=["CID"])
     grouped = df.groupby(["CID", "StandardPropertyName"], dropna=False)["NumericValue"]
     summary = grouped.agg(
         median="median",
@@ -382,8 +490,12 @@ def main() -> None:
     df = remove_non_quantitative_categories(df)
     df = remove_garbage_values(df)
     df = apply_standardization(df)
-    df = df[df["NumericValue"].notna()].copy()
     df = df[df["StandardPropertyName"].notna()].copy()
+    # Convert every value to its property's canonical unit BEFORE aggregation,
+    # then drop rows that couldn't be converted or are physically impossible.
+    df = add_canonical_values(df)
+    df = df[df["NumericValue"].notna()].copy()
+    df = apply_physical_bounds(df)
     df = deduplicate_measurements(df)
 
     df.to_csv(args.output, index=False)
@@ -391,11 +503,18 @@ def main() -> None:
     summary_df = generate_summary(df)
     summary_df.to_csv(args.summary_output, index=False)
 
-    ml_df = generate_ml_dataset(df)
-    ml_df.to_csv(args.ml_output, index=False)
+    # Split property columns: frequent ones feed training; near-empty ones are
+    # preserved in a separate wide table instead of being deleted or left to
+    # pollute the feature matrix.
+    frequent_props, sparse_props = split_by_coverage(df, args.min_coverage)
+    generate_ml_dataset(df, include_props=frequent_props).to_csv(args.ml_output, index=False)
+    generate_ml_dataset(df, include_props=sparse_props).to_csv(args.sparse_output, index=False)
 
     rare_df = export_rare_properties(df, args.rare_output)
     report_lines = build_report(original_count, df, raw_property_count, rare_df)
+    report_lines.append("")
+    report_lines.append(f"Frequent properties (≥{args.min_coverage:.1%} compounds): {len(frequent_props)} → {args.ml_output}")
+    report_lines.append(f"Sparse properties (<{args.min_coverage:.1%} compounds): {len(sparse_props)} → {args.sparse_output}")
     with open(args.report_output, "w", encoding="utf-8") as report_file:
         report_file.write("\n".join(report_lines))
 

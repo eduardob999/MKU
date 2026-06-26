@@ -58,6 +58,8 @@ class DatasetParams:
         default=False, metadata={"help": "Merge pharmacology into the wide ML output"})
     wide_from_clean: bool = field(
         default=True, metadata={"help": "Build the wide output via the clean_thermo pipeline"})
+    fetch_pubmed: bool = field(
+        default=False, metadata={"help": "Mine PubMed (opt-in; needs IVETTE_PUBMED_API_KEY) — literature signal only"})
 
 
 @dataclass

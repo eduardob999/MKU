@@ -21,16 +21,21 @@ def build_pubmed_query(name: str) -> str:
     return f'"{safe_name}"[TIAB] AND ({terms})'
 
 
-def pubmed_search(name: str, max_results: int = 10) -> tuple[int, list[str]]:
+def pubmed_search(name: str, max_results: int = 10, api_key: str = "") -> tuple[int, list[str]]:
     params = {"db": "pubmed", "retmode": "json", "retmax": str(max_results), "term": build_pubmed_query(name)}
+    if api_key:
+        params["api_key"] = api_key
     data = http.get_json(ENTREZ_ESEARCH, params=params).get("esearchresult", {})
     return int(data.get("count", "0")), data.get("idlist", [])
 
 
-def pubmed_fetch_abstracts(pmids: list[str]) -> list[dict]:
+def pubmed_fetch_abstracts(pmids: list[str], api_key: str = "") -> list[dict]:
     if not pmids:
         return []
-    r = http.get(ENTREZ_EFETCH, params={"db": "pubmed", "retmode": "xml", "id": ",".join(pmids)})
+    params = {"db": "pubmed", "retmode": "xml", "id": ",".join(pmids)}
+    if api_key:
+        params["api_key"] = api_key
+    r = http.get(ENTREZ_EFETCH, params=params)
     r.raise_for_status()
     root = ET.fromstring(r.content)
     articles = []
@@ -63,8 +68,9 @@ def pubmed_links(pmids: list[str]) -> str:
     return " ".join(f"https://pubmed.ncbi.nlm.nih.gov/{p}/" for p in pmids if p)
 
 
-def analyze_pubmed(name: str, max_results: int = 10) -> dict:
-    result = {
+def empty_pubmed_result() -> dict:
+    """The PubMed columns with default/empty values (used when PubMed is off)."""
+    return {
         "PubMed_Thermo_Count": 0,
         "PubMed_Top_PMIDs": "",
         "PubMed_PubMed_Links": "",
@@ -72,15 +78,19 @@ def analyze_pubmed(name: str, max_results: int = 10) -> dict:
         "PubMed_Example_Matches": "",
         "PubMed_Supplementary_Count": 0,
     }
+
+
+def analyze_pubmed(name: str, max_results: int = 10, api_key: str = "") -> dict:
+    result = empty_pubmed_result()
     try:
-        total, ids = pubmed_search(name, max_results=max_results)
+        total, ids = pubmed_search(name, max_results=max_results, api_key=api_key)
         result["PubMed_Thermo_Count"] = total
         result["PubMed_Top_PMIDs"] = ",".join(ids)
         result["PubMed_PubMed_Links"] = pubmed_links(ids)
         if not ids:
             return result
         time.sleep(0.2)
-        articles = pubmed_fetch_abstracts(ids)
+        articles = pubmed_fetch_abstracts(ids, api_key=api_key)
         matches, supplementary = [], 0
         for art in articles:
             text = " ".join([art["title"], art["abstract"]]).strip()
