@@ -55,7 +55,6 @@ else:
             continue
 
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Theme
@@ -230,6 +229,8 @@ class Panel:
     bench: Path
     _fp: object = None
     _drawn: bool = False
+    period: float = 0.0          # min seconds between data checks (0 = every tick)
+    _last_check: float = -1.0e9
 
     def fingerprint(self):
         return None
@@ -238,7 +239,17 @@ class Panel:
         ...
 
     def tick(self) -> bool:
-        """Re-render only if the underlying data changed. Returns True if drawn."""
+        """Re-check (and re-render if changed) once this panel's refresh period
+        has elapsed. Returns True only if it actually redrew.
+
+        The period throttles the cost of fingerprinting itself (each check walks
+        the data tree), so slow/rarely-changing panels poll far less often than
+        the live ones — keeping idle CPU low.
+        """
+        now = time.monotonic()
+        if self._drawn and (now - self._last_check) < self.period:
+            return False
+        self._last_check = now
         cur = self.fingerprint()
         if self._drawn and cur == self._fp:
             return False
@@ -699,33 +710,49 @@ class ControlRoom:
 
         # Top row: throughput / sizing / pipeline overview. Bottom row: the
         # per-molecule detail of whatever is running right now, plus model CV.
+        #
+        # period = how often each panel re-checks its data. The live panels
+        # (batch, opt, freq) check every tick; benchmark/model/dataset panels
+        # change rarely (or not during a Gaussian run) so they poll seldom,
+        # which is where most of the idle CPU is saved.
         self.panels = [
-            CpuScalingPanel(axes[0], data_root, self.bench),
-            PreoptPanel(axes[1], data_root, self.bench),
-            BatchPanel(axes[2], data_root, self.bench),
-            DatasetProgressPanel(axes[3], data_root, self.bench),
-            OptConvergencePanel(axes[4], data_root, self.bench),
-            FreqProgressPanel(axes[5], data_root, self.bench),
-            ThermoPanel(axes[6], data_root, self.bench),
-            ModelCVPanel(axes[7], data_root, self.bench),
+            CpuScalingPanel(axes[0], data_root, self.bench, period=60.0),
+            PreoptPanel(axes[1], data_root, self.bench, period=60.0),
+            BatchPanel(axes[2], data_root, self.bench, period=0.0),
+            DatasetProgressPanel(axes[3], data_root, self.bench, period=20.0),
+            OptConvergencePanel(axes[4], data_root, self.bench, period=0.0),
+            FreqProgressPanel(axes[5], data_root, self.bench, period=0.0),
+            ThermoPanel(axes[6], data_root, self.bench, period=20.0),
+            ModelCVPanel(axes[7], data_root, self.bench, period=60.0),
         ]
         self._suptitle = self.fig.suptitle("", color=FG, fontsize=13, fontweight="bold")
 
-    def update(self, _=None):
-        # Only panels whose data changed are re-parsed/redrawn.
+    def update(self, _=None) -> bool:
+        # Only panels whose data changed are re-parsed/redrawn. Returns True if
+        # anything actually changed, so the caller can skip the canvas redraw.
+        changed = False
         for panel in self.panels:
-            panel.tick()
-        self._suptitle.set_text(
-            f"◆ IVETTE CONTROL ROOM      {self.root}      "
-            f"updated {time.strftime('%H:%M:%S')}"
-        )
+            if panel.tick():
+                changed = True
+        if changed:
+            self._suptitle.set_text(
+                f"◆ IVETTE CONTROL ROOM      {self.root}      "
+                f"updated {time.strftime('%H:%M:%S')}"
+            )
+        return changed
+
+    def _on_tick(self):
+        # Redraw the window only when a panel changed — an idle dashboard does
+        # essentially no work instead of force-repainting on every timer tick.
+        if self.update():
+            self.fig.canvas.draw_idle()
 
     def run_live(self):
         self.update()
-        self._anim = FuncAnimation(
-            self.fig, self.update, interval=self.interval * 1000,
-            cache_frame_data=False,
-        )
+        self.fig.canvas.draw_idle()
+        self._timer = self.fig.canvas.new_timer(interval=int(self.interval * 1000))
+        self._timer.add_callback(self._on_tick)
+        self._timer.start()
         plt.show(block=True)
 
     def run_once(self, out: Path):
@@ -740,7 +767,8 @@ def main():
     parser = argparse.ArgumentParser(description="Ivette Gaussian control room")
     parser.add_argument("--data-dir", type=Path, default=repo_root / "data" / "geometries",
                         help="Directory holding benchmark JSON + run logs")
-    parser.add_argument("--interval", type=float, default=4.0, help="Refresh seconds")
+    parser.add_argument("--interval", type=float, default=8.0,
+                        help="Base refresh seconds for the live panels (default: 8)")
     parser.add_argument("--once", action="store_true", help="Render one PNG and exit")
     parser.add_argument("--save", type=Path, default=None,
                         help="PNG path for --once (default: <data-dir>/control_room.png)")
