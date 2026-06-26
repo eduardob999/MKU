@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from ivette.util.text import extract_numeric
+from ivette.util.paths import export_path
 
 PARSER_ARTIFACT_NAMES = [
     "Quantity",
@@ -133,12 +134,12 @@ DB_REF_REGEX = re.compile(r"^\s*[A-Za-z]{1,10}:[^\s]+\s*$")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Clean thermo property data for ML and summary outputs.")
-    parser.add_argument("input", nargs="?", default="thermo_parsed.csv", help="Input long-format CSV file")
-    parser.add_argument("--output", default="thermo_cleaned.csv", help="Cleaned long-format output")
-    parser.add_argument("--summary-output", default="thermo_summary.csv", help="Compound/property summary statistics")
-    parser.add_argument("--ml-output", default="thermo_ml.csv", help="Machine learning wide-format dataset")
-    parser.add_argument("--rare-output", default="rare_properties.csv", help="Rare property frequency export")
-    parser.add_argument("--report-output", default="cleaning_report.txt", help="Cleaning report text file")
+    parser.add_argument("input", nargs="?", default=export_path("thermo_parsed.csv"), help="Input long-format CSV file")
+    parser.add_argument("--output", default=export_path("thermo_cleaned.csv"), help="Cleaned long-format output")
+    parser.add_argument("--summary-output", default=export_path("thermo_summary.csv"), help="Compound/property summary statistics")
+    parser.add_argument("--ml-output", default=export_path("thermo_ml.csv"), help="Machine learning wide-format dataset")
+    parser.add_argument("--rare-output", default=export_path("rare_properties.csv"), help="Rare property frequency export")
+    parser.add_argument("--report-output", default=export_path("cleaning_report.txt"), help="Cleaning report text file")
     return parser.parse_args()
 
 

@@ -7,6 +7,7 @@ import sys
 import time
 
 from ivette.util import http
+from ivette.util import applog
 from ivette.util.csvio import write_csv
 from ivette.util.timing import TimingLog
 from ivette.module.cli import build_arg_parser, interactive_parameter_menu
@@ -83,7 +84,11 @@ def main(argv=None):
     if args.menu:
         args = interactive_parameter_menu(args)
 
+    applog.configure()
+    log = applog.get_logger("dataset")
     timing_log_path = getattr(args, "timing_log", "timing_log.txt")
+    log.info("dataset run starting | input=%s max=%s pharma=%s",
+             args.input, args.max, getattr(args, "fetch_pharma", None))
     tlog = TimingLog(timing_log_path)
 
     if not os.path.exists(args.input):

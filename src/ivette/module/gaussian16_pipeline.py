@@ -113,6 +113,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -122,6 +123,24 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from ivette.module import gaussian16_core as g16
 from ivette.util import jsonstore
+from ivette.util import applog
+
+_preopt_log = applog.get_logger("gaussian.preopt")
+
+
+def _log_preopt_fallback(message, *, cid, method, conf_label, detail=None):
+    """Persist a recovered pre-optimisation degradation to the central log.
+
+    These are WARNINGs, not errors: the DFT job still runs from the input
+    geometry, so the result is not lost. They land in ``data/logs/ivette.log``
+    (for spotting patterns like repeated PM7 segfaults) but deliberately not in
+    ``errors.log``, which is reserved for failures that actually lose a result.
+    The live ``print`` next to each call keeps the immediate console feedback;
+    this just makes the event survive after the run for debugging.
+    """
+    extra = f" :: {detail}" if detail else ""
+    _preopt_log.warning("preopt fallback | cid=%s method=%s conf=%s | %s%s",
+                        cid, method, conf_label, message, extra)
 
 # ── RDKit ─────────────────────────────────────────────────────────────────────
 try:
@@ -804,6 +823,8 @@ def gaussian_semiempirical_preopt(
     except Exception as exc:
         print(f"    [preopt] WARNING: could not read {input_sdf}: {exc}. "
               f"Skipping preopt.")
+        _log_preopt_fallback("could not read input SDF; skipping preopt",
+                             cid=cid, method=method, conf_label=conf_label, detail=str(exc)[:200])
         return input_sdf
 
     # ── Build .gjf ────────────────────────────────────────────────────────────
@@ -828,6 +849,8 @@ def gaussian_semiempirical_preopt(
     else:
         print(f"    [preopt] WARNING: unknown preopt method '{method}'. "
               f"Supported: pm7, xtb. Skipping preopt.")
+        _log_preopt_fallback(f"unknown preopt method '{method}'; skipping preopt",
+                             cid=cid, method=method, conf_label=conf_label)
         return input_sdf
 
     with open(gjf_path, "w") as fh:
@@ -842,6 +865,11 @@ def gaussian_semiempirical_preopt(
     if not ok or not g16.check_normal_termination(log_path):
         print(f"    [preopt] WARNING: Gaussian {tag} preopt did not terminate "
               f"normally ({err or 'check log'}). Using CREST geometry.")
+        # Keep just the first line of any crash dump — a G16 segfault dumps a
+        # whole register table to stderr that we don't want flooding the log.
+        reason = (err or "").strip().splitlines()[0][:200] if err else "non-normal termination"
+        _log_preopt_fallback("preopt did not terminate normally; using input geometry",
+                             cid=cid, method=method, conf_label=conf_label, detail=reason)
         _cleanup_preopt_scratch(scratch_dir, cid, conf_label, method)
         return input_sdf
 
@@ -850,6 +878,8 @@ def gaussian_semiempirical_preopt(
     if opt_coord_block is None:
         print(f"    [preopt] WARNING: no geometry found in {log_path}. "
               f"Using CREST geometry.")
+        _log_preopt_fallback("no geometry found in preopt log; using input geometry",
+                             cid=cid, method=method, conf_label=conf_label)
         _cleanup_preopt_scratch(scratch_dir, cid, conf_label, method)
         return input_sdf
 
@@ -885,6 +915,8 @@ def gaussian_semiempirical_preopt(
     if not sdf_ok:
         print(f"    [preopt] WARNING: could not convert optimised geometry "
               f"to SDF. Using CREST geometry.")
+        _log_preopt_fallback("could not convert optimised geometry to SDF; using input geometry",
+                             cid=cid, method=method, conf_label=conf_label)
         _cleanup_preopt_scratch(scratch_dir, cid, conf_label, method)
         return input_sdf
 
@@ -1246,6 +1278,15 @@ def batch_run(
         f"{len(pending)} to run, {skipped} already complete."
     )
 
+    # Central log + per-run timing.json (lands in this charge state's work dir).
+    log = applog.get_logger("gaussian")
+    run_label = operation + (" +COSMO" if cosmo else "")
+    timing = applog.RunTiming(work_dir, run_label=run_label, logger=log)
+    log.info("batch start | dir=%s op=%s cosmo=%s charge=%s mult=%s jobs=%s "
+             "nproc=%s mem=%s preopt=%s pending=%d skipped=%d",
+             work_dir.name, operation, cosmo, charge, multiplicity, jobs,
+             nproc, mem, preopt_mode, len(pending), skipped)
+
     kwargs = dict(
         g16_exec=g16_exec, basis_set=basis_set, method=method, operation=operation,
         preopt_mode=preopt_mode, preopt_basis_set=preopt_basis_set,
@@ -1253,18 +1294,25 @@ def batch_run(
         cosmo=cosmo, timeout=timeout,
     )
 
-    def _record(result):
+    def _record(result, seconds):
         done[result.cid] = {
             "success": result.success,
             "log": result.log_path,
             "error": result.error_msg,
         }
         jsonstore.write_json(ckpt_path, done)
+        timing.record(result.cid, seconds, success=result.success)
+        if result.success:
+            log.info("compound ok | cid=%s duration_s=%.1f", result.cid, seconds)
+        else:
+            log.error("compound FAILED | cid=%s duration_s=%.1f error=%s",
+                      result.cid, seconds, (result.error_msg or "").strip()[:200])
 
     results = []
     if jobs <= 1:
         for i, sdf in enumerate(pending, 1):
             print(f"[{i}/{len(pending)}] {sdf.name}", flush=True)
+            t0 = time.perf_counter()
             try:
                 result = g16.run_compound(str(sdf), str(work_dir), **kwargs)
             except Exception as exc:
@@ -1272,17 +1320,21 @@ def batch_run(
                     cid=sdf.stem, sdf_path=str(sdf), gjf_path="",
                     log_path="", success=False, error_msg=str(exc),
                 )
+                log.exception("compound crashed | cid=%s", sdf.stem)
             results.append(result)
-            _record(result)
+            _record(result, time.perf_counter() - t0)
     else:
         try:
             with ProcessPoolExecutor(max_workers=jobs) as pool:
-                futures = {
-                    pool.submit(g16.run_compound, str(sdf), str(work_dir), **kwargs): sdf
-                    for sdf in pending
-                }
+                submitted = {}
+                futures = {}
+                for sdf in pending:
+                    fut = pool.submit(g16.run_compound, str(sdf), str(work_dir), **kwargs)
+                    futures[fut] = sdf
+                    submitted[fut] = time.perf_counter()
                 for i, future in enumerate(as_completed(futures), 1):
                     sdf = futures[future]
+                    seconds = time.perf_counter() - submitted[future]
                     try:
                         result = future.result()
                     except Exception as exc:
@@ -1290,17 +1342,21 @@ def batch_run(
                             cid=sdf.stem, sdf_path=str(sdf), gjf_path="",
                             log_path="", success=False, error_msg=str(exc),
                         )
+                        log.exception("compound crashed | cid=%s", sdf.stem)
                     print(f"[{i}/{len(pending)}] {sdf.name}", flush=True)
                     results.append(result)
-                    _record(result)
+                    _record(result, seconds)
         except KeyboardInterrupt:
             print("\n[SIGINT] Cancelling pending jobs and cleaning up…", flush=True)
+            log.warning("batch interrupted by user | dir=%s completed=%d/%d",
+                        work_dir.name, len(results), len(pending))
             pool.shutdown(wait=False)
             raise
 
     ok = sum(1 for r in results if r.success)
     print(f"Batch complete: {ok}/{len(results)} succeeded "
           f"({skipped} skipped from a previous run).")
+    timing.summary(succeeded=ok, failed=len(results) - ok, skipped=skipped)
     return results
 
 

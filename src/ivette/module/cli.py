@@ -2,30 +2,36 @@
 import sys
 import argparse
 
+from ivette.util.paths import export_path, log_path
+
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Find NIST WebBook and PubMed thermo information")
 
-    p.add_argument("--input", default="smiles.csv")
-    p.add_argument("--output", default="thermo_report.csv")
-    p.add_argument("--available-output", default="thermo_available.csv")
-    p.add_argument("--parsed-output", default="thermo_parsed.csv")
+    # Output defaults live under data/exports/ (never the repo root); the
+    # interactive app overrides these with per-run paths.
+    p.add_argument("--input", default=export_path("smiles.csv"))
+    p.add_argument("--output", default=export_path("thermo_report.csv"))
+    p.add_argument("--available-output", default=export_path("thermo_available.csv"))
+    p.add_argument("--parsed-output", default=export_path("thermo_parsed.csv"))
 
     p.add_argument("--fetch-pharma", action="store_true", default=True)
-    p.add_argument("--pharma-output", default="pharma_parsed.csv")
+    p.add_argument("--pharma-output", default=export_path("pharma_parsed.csv"))
 
     p.add_argument("--merge-pharma", action="store_true", default=True)
-    p.add_argument("--merged-pharma-output", default="thermo_pharma_merged.csv")
+    p.add_argument("--merged-pharma-output", default=export_path("thermo_pharma_merged.csv"))
 
     p.add_argument("--chembl-target-cache", default="scripts/chembl_target_name_cache.json")
 
-    p.add_argument("--cleaned-output", default="thermo_cleaned.csv")
-    p.add_argument("--summary-output", default="thermo_summary.csv")
-    p.add_argument("--ml-output", default="thermo_ml.csv")
-    p.add_argument("--rare-output", default="rare_properties.csv")
-    p.add_argument("--cleaning-report", default="cleaning_report.txt")
+    p.add_argument("--cleaned-output", default=export_path("thermo_cleaned.csv"))
+    p.add_argument("--summary-output", default=export_path("thermo_summary.csv"))
+    p.add_argument("--ml-output", default=export_path("thermo_ml.csv"))
+    p.add_argument("--rare-output", default=export_path("rare_properties.csv"))
+    p.add_argument("--cleaning-report", default=export_path("cleaning_report.txt"))
+    p.add_argument("--timing-log", default=log_path("timing_log.txt"),
+                   help="Per-run timing log (default: data/logs/timing_log.txt)")
 
-    p.add_argument("--wide-output", default="thermo_wide.csv")
+    p.add_argument("--wide-output", default=export_path("thermo_wide.csv"))
     p.add_argument("--wide-from-clean", action="store_true", default=True)
 
     p.add_argument("--max", type=int, default=40)

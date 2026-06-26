@@ -17,6 +17,7 @@ from rdkit import Chem
 from ivette.util import http
 from ivette.util.prompts import ask, ask_yn
 from ivette.util.text import chunked
+from ivette.util.paths import export_path
 
 PUBCHEM_BASE = http.PUBCHEM_PUG
 
@@ -134,7 +135,7 @@ def main(argv=None):
     p.add_argument("--properties", nargs="+", default=None, help="List of properties to fetch (space separated)")
     p.add_argument("--batch-size", type=int, default=None, help="Number of CIDs per properties request (default: 100)")
     p.add_argument("--sleep", type=float, default=None, help="Seconds to sleep between requests (default: 0.2)")
-    p.add_argument("--output", default="smiles.csv", help="Output CSV filename")
+    p.add_argument("--output", default=export_path("smiles.csv"), help="Output CSV filename")
     p.add_argument("--limit-substructures", type=int, default=None, help="Only process first N substructures from input file")
     p.add_argument("--no-menu", action="store_true", help="Skip interactive menu and use defaults/CLI args as-is")
     args = p.parse_args(argv)

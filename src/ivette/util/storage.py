@@ -30,6 +30,8 @@ from ivette.util.paths import (
     GEOMETRY_METADATA_FILE,
     DFT_DESCRIPTOR_DIR,
     DFT_DESCRIPTOR_METADATA_FILE,
+    LOG_DIR,
+    EXPORT_DIR,
 )
 
 # One store per entity. Args: (file, top-level key, id prefix).
@@ -49,7 +51,7 @@ def ensure_storage():
     """Create every data directory and an empty metadata file where missing."""
     for store in (STRUCTURES, COMPOUNDS, DATASETS, MODELS, GEOMETRIES, DFT_DESCRIPTORS):
         store.ensure()
-    for run_dir in (DATASET_RUN_DIR, GEOMETRY_RUN_DIR, MODEL_RUN_DIR):
+    for run_dir in (DATASET_RUN_DIR, GEOMETRY_RUN_DIR, MODEL_RUN_DIR, LOG_DIR, EXPORT_DIR):
         run_dir.mkdir(parents=True, exist_ok=True)
 
 

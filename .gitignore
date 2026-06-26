@@ -55,6 +55,14 @@ cover/
 *.mo
 *.pot
 
+# Ivette stray run artifacts — outputs are routed under data/ (ignored);
+# these guard against Gaussian/standalone tools dropping files in the repo root.
+fort.7
+fort.*
+/timing_log.txt
+/rare_properties.csv
+/diagnostic.txt
+
 # Django stuff:
 *.log
 local_settings.py

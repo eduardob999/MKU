@@ -14,6 +14,10 @@ import argparse
 import csv
 import sys
 from collections import defaultdict
+from pathlib import Path
+
+# Default report sink — data/exports/ keeps the repo root clean.
+_DEFAULT_DIAGNOSTIC = Path(__file__).resolve().parents[1] / "data" / "exports" / "diagnostic.txt"
 
 
 # ── Column classification ────────────────────────────────────────────────────
@@ -73,7 +77,7 @@ def main(argv=None):
         description="Diagnose dataset sparsity and target coverage for ML preparation."
     )
     ap.add_argument("--input",   required=True,              help="Wide-format CSV")
-    ap.add_argument("--output",  default="diagnostic.txt",   help="Report output path")
+    ap.add_argument("--output",  default=str(_DEFAULT_DIAGNOSTIC),   help="Report output path (default: data/exports/diagnostic.txt)")
     ap.add_argument("--target-min-coverage", type=float, default=0.05,
                     help="Min fraction of compounds with a value to keep a target (default: 0.05)")
     ap.add_argument("--feature-min-coverage", type=float, default=0.10,
@@ -191,6 +195,7 @@ def main(argv=None):
     report = "\n".join(lines)
     print("\n" + report)
 
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as fh:
         fh.write(report)
     print(f"\nReport saved to '{args.output}'")

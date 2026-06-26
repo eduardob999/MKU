@@ -251,19 +251,27 @@ def run_gaussian(
     log_path: str,
     g16_exec: str = "g16",
     timeout:  Optional[int] = None,   # seconds; None = no limit
+    cwd:      Optional[str] = None,
 ) -> tuple[bool, str]:
     """
     Run Gaussian 16 on *gjf_path*, writing output to *log_path*.
 
     Returns (success: bool, stderr_or_error: str).
+
+    Gaussian writes stray files (the ``fort.7`` punch file, ``Gau-*`` temporaries)
+    into its working directory. We default *cwd* to the directory holding the
+    output log so those land beside the job's own files instead of polluting
+    wherever the CLI was launched from (the repository root).
     """
     cmd = [g16_exec, gjf_path, log_path]
+    run_cwd = cwd or os.path.dirname(os.path.abspath(log_path)) or None
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             timeout=timeout,
+            cwd=run_cwd,
         )
         if result.returncode != 0:
             return False, result.stderr.strip() or f"Exit code {result.returncode}"

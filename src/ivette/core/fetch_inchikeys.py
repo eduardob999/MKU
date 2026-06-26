@@ -8,6 +8,7 @@ import time
 
 from ivette.util import http
 from ivette.util.text import chunked
+from ivette.util.paths import export_path
 
 PROPERTIES = "InChIKey,IsomericSMILES,CanonicalSMILES".split(",")
 
@@ -37,7 +38,7 @@ def main(argv=None):
         description="Fetch InChIKeys from PubChem for CIDs in a CSV."
     )
     ap.add_argument("--input",     required=True,            help="Input CSV containing a CID column")
-    ap.add_argument("--output",    default="cid_inchikey.csv", help="Output CSV (default: cid_inchikey.csv)")
+    ap.add_argument("--output",    default=export_path("cid_inchikey.csv"), help="Output CSV (default: data/exports/cid_inchikey.csv)")
     ap.add_argument("--cid-col",   default="CID",            help="Name of the CID column (default: CID)")
     ap.add_argument("--batch-size", type=int, default=200,   help="CIDs per request (default: 200)")
     ap.add_argument("--sleep",      type=float, default=0.5, help="Seconds between requests (default: 0.5)")

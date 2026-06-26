@@ -45,3 +45,23 @@ GAUSSIAN_BENCHMARK_RUN_DIR = GEOMETRY_DIR / "benchmark_runs"
 # DFT descriptor sets (per-compound properties parsed from Gaussian freq logs)
 DFT_DESCRIPTOR_DIR = DATA_DIR / "dft_descriptors"
 DFT_DESCRIPTOR_METADATA_FILE = DFT_DESCRIPTOR_DIR / "metadata.json"
+
+# Cross-cutting output locations. Keeping these under data/ (which is
+# .gitignored) is what keeps the repository root free of stray run artifacts.
+LOG_DIR = DATA_DIR / "logs"          # application log + standalone-run timing logs
+EXPORT_DIR = DATA_DIR / "exports"    # default sink for standalone CLI outputs
+
+
+def export_path(name: str) -> str:
+    """Default output path for a standalone CLI artifact (``data/exports/<name>``).
+
+    Used as argparse defaults so that running a sub-tool directly never drops
+    files into the repository root. The interactive app always passes explicit
+    paths into a run's own directory and so does not rely on this.
+    """
+    return str(EXPORT_DIR / name)
+
+
+def log_path(name: str) -> str:
+    """Default path for a log/timing artifact (``data/logs/<name>``)."""
+    return str(LOG_DIR / name)

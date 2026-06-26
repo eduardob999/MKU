@@ -28,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
 import sys
@@ -500,6 +501,102 @@ class ThermoPanel(Panel):
             y -= 0.095
 
 
+class DatasetProgressPanel(Panel):
+    """Live throughput of the most recent property-dataset mining run.
+
+    Reads the run's ``timing_log.txt`` (written incrementally under
+    ``data/datasets/runs/<id>/``); counts distinct CIDs seen and derives a
+    compounds/second rate from the recorded start time.
+    """
+
+    def _timing(self) -> Optional[Path]:
+        runs = self.root.parent / "datasets" / "runs"
+        return latest(runs, "timing_log.txt") if runs.exists() else None
+
+    def fingerprint(self):
+        return fp(self._timing())
+
+    def render(self):
+        self.ax.set_axis_off()
+        self._title("Dataset mining")
+        tl = self._timing()
+        if not tl:
+            return self._empty("no dataset run yet")
+        text = tl.read_text(errors="replace")
+        cids = set(re.findall(r"CID=(\d+)", text))
+        n = len(cids)
+        started_m = re.search(r"# Run started (\S+)", text)
+        started = _parse_iso(started_m.group(1)) if started_m else None
+        finalized = "TOTAL" in text
+        total_m = re.search(r"COMPOUNDS PROCESSED\s+(\d+)", text)
+        total = int(total_m.group(1)) if total_m else None
+        elapsed = (time.time() - started) if (started and not finalized) else None
+
+        ax = self.ax
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.text(0.03, 0.92, tl.parent.name, color=ACCENT, fontsize=9,
+                fontweight="bold", transform=ax.transAxes)
+        state_txt, state_col = (("✓ complete", GREEN) if finalized else ("● mining", GOLD))
+        ax.text(0.97, 0.92, state_txt, color=state_col, fontsize=9, ha="right",
+                transform=ax.transAxes)
+
+        if finalized and total:
+            frac = 1.0
+            ax.add_patch(plt.Rectangle((0.03, 0.6), 0.94, 0.14, color="#30363d"))
+            ax.add_patch(plt.Rectangle((0.03, 0.6), 0.94 * frac, 0.14, color=GREEN))
+            ax.text(0.5, 0.67, f"{total} compounds", ha="center", va="center",
+                    color=BG, fontsize=10, fontweight="bold")
+        else:
+            ax.text(0.03, 0.62, f"compounds seen: {n}", color=FG, fontsize=11)
+            if elapsed and n:
+                rate = n / elapsed
+                ax.text(0.03, 0.44, f"rate: {rate*60:.1f} / min   ·   elapsed {_fmt_dur(elapsed)}",
+                        color=MUTED, fontsize=9)
+
+
+class ModelCVPanel(Panel):
+    """Cross-validation R² per target for the most recently trained model."""
+
+    def _report(self) -> Optional[Path]:
+        runs = self.root.parent / "models" / "runs"
+        return latest(runs, "model_report.csv") if runs.exists() else None
+
+    def fingerprint(self):
+        return fp(self._report())
+
+    def render(self):
+        rep = self._report()
+        if not rep:
+            self._title("Model CV R²")
+            return self._empty("no trained model yet")
+        rows = []
+        try:
+            with open(rep, newline="") as fh:
+                for r in csv.DictReader(fh):
+                    try:
+                        rows.append((r.get("target", "?"), float(r["cv_r2_mean"])))
+                    except (KeyError, ValueError, TypeError):
+                        continue
+        except OSError:
+            pass
+        if not rows:
+            self._title("Model CV R²")
+            return self._empty("no CV scores yet")
+        rows.sort(key=lambda x: x[1])
+        rows = rows[-12:]                          # best dozen targets, ascending
+        labels = [t[:24] for t, _ in rows]
+        vals = [v for _, v in rows]
+        ax = self.ax
+        ax.barh(range(len(vals)), vals, color=[GREEN if v >= 0 else RED for v in vals])
+        ax.set_yticks(range(len(labels)))
+        ax.set_yticklabels(labels, fontsize=7)
+        ax.axvline(0, color=MUTED, lw=0.8)
+        ax.set_xlabel("CV R²")
+        ax.grid(True, axis="x", alpha=0.3)
+        self._title(f"Model CV R² · {rep.parent.name} · {len(rows)} targets")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Benchmark / batch helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -595,18 +692,22 @@ class ControlRoom:
         self.bench = data_root / "gaussian_benchmark.json"
         self.interval = interval
 
-        self.fig = plt.figure(figsize=(16, 9), constrained_layout=True)
+        self.fig = plt.figure(figsize=(18, 9), constrained_layout=True)
         self.fig.canvas.manager.set_window_title("Ivette — Control Room")
-        gs = self.fig.add_gridspec(2, 3)
-        axes = [self.fig.add_subplot(gs[r, c]) for r in range(2) for c in range(3)]
+        gs = self.fig.add_gridspec(2, 4)
+        axes = [self.fig.add_subplot(gs[r, c]) for r in range(2) for c in range(4)]
 
+        # Top row: throughput / sizing / pipeline overview. Bottom row: the
+        # per-molecule detail of whatever is running right now, plus model CV.
         self.panels = [
             CpuScalingPanel(axes[0], data_root, self.bench),
             PreoptPanel(axes[1], data_root, self.bench),
             BatchPanel(axes[2], data_root, self.bench),
-            OptConvergencePanel(axes[3], data_root, self.bench),
-            FreqProgressPanel(axes[4], data_root, self.bench),
-            ThermoPanel(axes[5], data_root, self.bench),
+            DatasetProgressPanel(axes[3], data_root, self.bench),
+            OptConvergencePanel(axes[4], data_root, self.bench),
+            FreqProgressPanel(axes[5], data_root, self.bench),
+            ThermoPanel(axes[6], data_root, self.bench),
+            ModelCVPanel(axes[7], data_root, self.bench),
         ]
         self._suptitle = self.fig.suptitle("", color=FG, fontsize=13, fontweight="bold")
 

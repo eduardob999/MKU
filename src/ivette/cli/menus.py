@@ -7,6 +7,7 @@ questionary); persistence lives in :mod:`ivette.util.storage`; session state in
 stays fixed in place.
 """
 
+import os
 import shutil
 import subprocess
 import sys
@@ -20,6 +21,7 @@ from rdkit.Chem import AllChem
 
 from ivette.cli import ui
 from ivette.cli.context import context, render_header
+from ivette.util import applog
 from ivette.util import hardware
 from ivette.util import jsonstore
 from ivette.util.paths import GAUSSIAN_BENCHMARK_RUN_DIR
@@ -484,6 +486,10 @@ def run_gaussian_pipeline(model_id, geometry_dir, operation, *, cosmo=False, cha
         title="Gaussian pipeline",
     )
 
+    # Bring up the live dashboard so benchmark, convergence and batch-progress
+    # plots are on screen as the run proceeds.
+    _ensure_control_room()
+
     # batch_run lives in the full Gaussian pipeline, which is imported lazily so
     # the rest of the CLI stays usable when that pipeline isn't available.
     try:
@@ -853,6 +859,7 @@ def generate_model_menu(dataset_id):
     parameters = {"radius": 2, "nbits": 512, "source_dataset": str(input_file)}
     register_model(dataset_id, name, parameters, output_dir)
 
+    _ensure_control_room()   # model CV-R² panel updates when training finishes
     ui.rule("Training model")
     argv = [
         "--input", str(input_file),
@@ -1353,6 +1360,7 @@ def new_dataset_menu(compound_id):
         "--cleaning-report", str(output_dir / "cleaning_report.csv"),
         "--pharma-output", str(output_dir / "pharma.csv"),
         "--merged-pharma-output", str(output_dir / "merged_pharma.csv"),
+        "--timing-log", str(output_dir / "timing_log.txt"),
         "--pubmed-max", str(params["pubmed_max"]),
         "--pubchem-max-aids", str(params["pubchem_max_aids"]),
         "--chembl-activity-limit", str(params["chembl_activity_limit"]),
@@ -1367,6 +1375,7 @@ def new_dataset_menu(compound_id):
     if params["wide_from_clean"]:
         argv.append("--wide-from-clean")
 
+    _ensure_control_room()   # dataset-mining throughput panel goes live
     ui.rule("Running find_thermo")
     try:
         find_thermo_main(argv)
@@ -1564,6 +1573,65 @@ def _launch_control_room():
             what="control room")
 
 
+# Background (non-blocking) live UI: at most one control-room window is kept
+# open across operations so progress/convergence plots are always on screen
+# while work runs. It refreshes off data files in a separate process, so it
+# costs the pipeline nothing.
+_control_room_proc = None
+
+
+def _display_available() -> bool:
+    """True if a GUI window can plausibly be shown.
+
+    Avoids spawning a doomed matplotlib process on a headless box. Windows/macOS
+    always have a display; on Linux we require an X/Wayland session (WSLg sets
+    DISPLAY, so this is true under WSL with GUI support).
+    """
+    if sys.platform.startswith("win") or sys.platform == "darwin":
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _live_ui_enabled() -> bool:
+    """Auto live UI is on unless IVETTE_LIVE_UI is set to a falsey value."""
+    return os.environ.get("IVETTE_LIVE_UI", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _ensure_control_room():
+    """Open the live control room in the background if not already running.
+
+    Non-blocking and idempotent — safe to call at the start of every operation.
+    No-ops when disabled, non-interactive, or no display is available.
+    """
+    global _control_room_proc
+    if not (_live_ui_enabled() and ui._interactive() and _display_available()):
+        return
+    if _control_room_proc is not None and _control_room_proc.poll() is None:
+        return  # one is already up
+    try:
+        _control_room_proc = subprocess.Popen(
+            [sys.executable, str(_REPO_ROOT / "scripts" / "control_room.py")],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        applog.get_logger("ui").info("live control room launched (pid=%s)", _control_room_proc.pid)
+        ui.note("📊 Live control room opened in a separate window (set IVETTE_LIVE_UI=0 to disable).")
+    except Exception as exc:  # never let a UI window break the actual work
+        applog.get_logger("ui").warning("could not launch control room: %s", exc)
+        _control_room_proc = None
+
+
+def _close_control_room():
+    """Terminate the background control room, if any (called on app exit)."""
+    global _control_room_proc
+    proc = _control_room_proc
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    _control_room_proc = None
+
+
 def _report_entities(title, store, kind, show_fn):
     """List entities of one stage; show metadata then offer the interactive plot."""
     while True:
@@ -1635,6 +1703,16 @@ def reports_menu():
 
 def main():
     ensure_storage()
+    applog.configure()
+    log = applog.get_logger("app")
+    log.info("Ivette session started")
+    try:
+        _run_main_loop(log)
+    finally:
+        _close_control_room()
+
+
+def _run_main_loop(log):
     with ui.fullscreen():
         while True:
             context.mode = "Structure Libraries"
@@ -1660,6 +1738,7 @@ def main():
             choice = ui.select("Structure libraries", choices)
             action, structure_id = (("exit", None) if choice is ui.CANCEL else choice)
             if action == "exit":
+                log.info("Ivette session ended")
                 break
             if action == "open":
                 structure_library_menu(structure_id)
