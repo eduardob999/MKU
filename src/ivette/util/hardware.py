@@ -241,6 +241,15 @@ def get_cached_benchmark_rows(key: str, *, path: str | Path = GAUSSIAN_BENCHMARK
     return rows if isinstance(rows, list) else None
 
 
+def _key_signature(key: str) -> str:
+    """A benchmark key with the (volatile) ``mem=`` token removed.
+
+    Two keys share a signature when they differ only by the memory figure — i.e.
+    stale variants left over from when the cache was keyed on fluctuating free RAM.
+    """
+    return ";".join(p for p in key.split(";") if not p.startswith("mem="))
+
+
 def store_benchmark_result(
     key: str,
     rows: list[dict],
@@ -249,14 +258,42 @@ def store_benchmark_result(
     path: str | Path = GAUSSIAN_BENCHMARK_FILE,
 ) -> None:
     cache = load_benchmark_cache(path)
-    cache.setdefault("benchmarks", {})[key] = {
+    bench = cache.setdefault("benchmarks", {})
+    # Self-heal: drop earlier entries that differ from this one only by the
+    # memory token, so the cache doesn't accumulate stale free-RAM variants.
+    sig = _key_signature(key)
+    for stale in [k for k in bench if k != key and _key_signature(k) == sig]:
+        del bench[stale]
+    bench[key] = {
         "updated": datetime.now().isoformat(timespec="seconds"),
         "best_value": best_value,
         "runs": rows,
     }
     if isinstance(best_value, int):
-        cache["benchmarks"][key]["best_threads"] = best_value
+        bench[key]["best_threads"] = best_value
     save_benchmark_cache(cache, path)
+
+
+def prune_benchmark_cache(*, path: str | Path = GAUSSIAN_BENCHMARK_FILE) -> int:
+    """Collapse stale-by-memory duplicate entries, keeping the newest per signature.
+
+    Returns the number of entries removed. Used to tidy caches written before the
+    keys were stabilised on total (rather than available) memory.
+    """
+    cache = load_benchmark_cache(path)
+    bench = cache.get("benchmarks", {})
+    by_sig: dict[str, list[tuple[str, dict]]] = {}
+    for k, v in bench.items():
+        by_sig.setdefault(_key_signature(k), []).append((k, v))
+    kept, removed = {}, 0
+    for items in by_sig.values():
+        items.sort(key=lambda kv: kv[1].get("updated", ""))
+        k, v = items[-1]            # newest wins
+        kept[k] = v
+        removed += len(items) - 1
+    cache["benchmarks"] = kept
+    save_benchmark_cache(cache, path)
+    return removed
 
 
 def benchmark_thread_plan(

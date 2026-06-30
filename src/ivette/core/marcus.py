@@ -118,8 +118,45 @@ def activation_energy(lam, dg_red):
     return (lam + dg_red) ** 2 / (4.0 * lam)
 
 
+import re
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+_ROUTE_RE = re.compile(r"#\S*\s+(\S+)/(\S+)")
+
+
+def cosmo_level(cosmo_root):
+    """``(method, basis_set)`` parsed from a COSMO run's route line, or ``None``.
+
+    Lets Marcus default its single points to the *same* level of theory the
+    geometries were optimized at (read straight from the .gjf, so it's exact).
+    Preopt inputs (PM7, no ``method/basis``) are skipped.
+    """
+    root = Path(cosmo_root)
+    for pattern in ("*_freq.gjf", "*_opt.gjf"):
+        for gjf in sorted(root.rglob(pattern)):
+            if "preopt" in gjf.parts:
+                continue
+            for line in gjf.read_text(errors="replace").splitlines():
+                if line.lstrip().startswith("#"):
+                    m = _ROUTE_RE.search(line)
+                    if m:
+                        return m.group(1), m.group(2)
+    return None
+
+
+def _run_sp_pair(task):
+    """Worker: the two cross single points for one compound (picklable, top-level)."""
+    (cid, ox_log, red_log, red_at_ox_dir, ox_at_red_dir,
+     red_q, red_m, ox_q, ox_m, settings) = task
+    e_r_og, _, err1 = _single_point(ox_log, red_at_ox_dir, cid,
+                                    charge=red_q, multiplicity=red_m, settings=settings)
+    e_o_rg, _, err2 = _single_point(red_log, ox_at_red_dir, cid,
+                                    charge=ox_q, multiplicity=ox_m, settings=settings)
+    return cid, e_r_og, e_o_rg, (err1 or err2) or ""
+
+
 def compute_marcus(cosmo_root, *, settings, oxidized=("neutral", 0, 1),
-                   reduced=("anion", -1, 2), progress=None):
+                   reduced=("anion", -1, 2), jobs=1, progress=None):
     """Per-CID Marcus reorganization energy + activation energy.
 
     ``cosmo_root`` is the ``.../gaussian/opt_then_freq_COSMO`` directory of a
@@ -127,8 +164,10 @@ def compute_marcus(cosmo_root, *, settings, oxidized=("neutral", 0, 1),
     ``(label, charge, multiplicity)`` triples matching that run's charge states.
     ``settings`` carries the level of theory + resources for the single points
     (``method``, ``basis_set``, ``nproc``, ``mem``, ``extra_keywords``,
-    ``timeout``, ``g16_exec``). The cross single points land in a sibling
-    ``marcus/`` directory and resume. ``progress(cid)`` is called per compound.
+    ``timeout``, ``g16_exec``). ``jobs`` runs that many compounds' single points
+    in parallel (like the opt+freq batch). The cross single points land in a
+    sibling ``marcus/`` directory and resume. ``progress(cid)`` is called per
+    compound as it completes.
 
     Returns ``(rows, skipped)`` — one feature dict per processed CID (with an
     ``error`` key, empty on success) and the CIDs lacking a completed pair.
@@ -142,36 +181,34 @@ def compute_marcus(cosmo_root, *, settings, oxidized=("neutral", 0, 1),
     red_at_ox_dir = marcus_root / "reduced_at_oxidized_geom"   # → E_R^OG
     ox_at_red_dir = marcus_root / "oxidized_at_reduced_geom"   # → E_O^RG
 
-    cids = available_pairs(cosmo_root, oxidized=ox_label, reduced=red_label)
-    rows, skipped = [], []
-    for cid in cids:
+    # Equilibrium energies + reduction ΔG come for free from the existing freq
+    # logs (fast, main process); only the two cross single points are computed.
+    prelim, tasks, skipped = {}, [], []
+    for cid in available_pairs(cosmo_root, oxidized=ox_label, reduced=red_label):
         ox_log = _completed_freq_log(ox_dir, cid)
         red_log = _completed_freq_log(red_dir, cid)
         if ox_log is None or red_log is None:
             skipped.append(cid)
             continue
-        if progress:
-            progress(cid)
+        prelim[cid] = (
+            g16.get_final_scf_energy(str(ox_log)),                 # E_O^OG
+            g16.get_final_scf_energy(str(red_log)),                # E_R^RG
+            (parse_freq_log(ox_log) or {}).get("gibbs_G"),         # G_ox
+            (parse_freq_log(red_log) or {}).get("gibbs_G"),        # G_red
+        )
+        tasks.append((cid, str(ox_log), str(red_log), str(red_at_ox_dir),
+                      str(ox_at_red_dir), red_q, red_m, ox_q, ox_m, settings))
 
-        # Equilibrium energies + reduction ΔG, free from the existing freq logs.
-        e_o_og = g16.get_final_scf_energy(str(ox_log))
-        e_r_rg = g16.get_final_scf_energy(str(red_log))
-        g_ox = (parse_freq_log(ox_log) or {}).get("gibbs_G")
-        g_red = (parse_freq_log(red_log) or {}).get("gibbs_G")
+    def _ev(x):
+        return x * HARTREE_TO_EV if x is not None else None
 
-        # The two cross single points (reuse the optimized geometries).
-        e_r_og, _, err1 = _single_point(ox_log, red_at_ox_dir, cid,
-                                        charge=red_q, multiplicity=red_m, settings=settings)
-        e_o_rg, _, err2 = _single_point(red_log, ox_at_red_dir, cid,
-                                        charge=ox_q, multiplicity=ox_m, settings=settings)
+    rows = []
 
+    def _finish(cid, e_r_og, e_o_rg, err):
+        e_o_og, e_r_rg, g_ox, g_red = prelim[cid]
         lam, lam1, lam2 = reorganization_energy(e_r_og, e_r_rg, e_o_rg, e_o_og)
         dg_red = (g_red - g_ox) if (g_red is not None and g_ox is not None) else None
         dg_act = activation_energy(lam, dg_red)
-
-        def _ev(x):
-            return x * HARTREE_TO_EV if x is not None else None
-
         rows.append({
             "CID": cid,
             "reorg_energy_eV": _ev(lam),
@@ -181,6 +218,19 @@ def compute_marcus(cosmo_root, *, settings, oxidized=("neutral", 0, 1),
             "dG_reduction_eV": _ev(dg_red),
             "activation_energy_eV": _ev(dg_act),
             "activation_energy_kcal": dg_act * HARTREE_TO_KCAL if dg_act is not None else None,
-            "error": (err1 or err2) or "",
+            "error": err,
         })
+        if progress:
+            progress(cid)
+
+    if jobs and jobs > 1 and tasks:
+        with ProcessPoolExecutor(max_workers=jobs) as pool:
+            futures = [pool.submit(_run_sp_pair, t) for t in tasks]
+            for fut in as_completed(futures):
+                _finish(*fut.result())
+    else:
+        for t in tasks:
+            _finish(*_run_sp_pair(t))
+
+    rows.sort(key=lambda r: str(r["CID"]))
     return rows, skipped

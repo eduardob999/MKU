@@ -6,6 +6,7 @@ from ivette.core.marcus import (
     HARTREE_TO_EV,
     activation_energy,
     available_pairs,
+    cosmo_level,
     reorganization_energy,
 )
 
@@ -54,3 +55,18 @@ def test_available_pairs_requires_both_completed_states(tmp_path):
 
 def test_available_pairs_empty_when_root_missing(tmp_path):
     assert available_pairs(tmp_path / "nope") == []
+
+
+def test_cosmo_level_reads_route_line_and_skips_preopt(tmp_path):
+    cosmo = tmp_path / "opt_then_freq_COSMO"
+    cell = cosmo / "neutral" / "100"
+    (cell / "preopt" / "pm7").mkdir(parents=True)
+    # Preopt route has no method/basis "/" — must be ignored.
+    (cell / "preopt" / "pm7" / "100_preopt.gjf").write_text("#p PM7 opt=(MaxCycles=500)\n")
+    (cell / "100_freq.gjf").write_text(
+        "%chk=100.chk\n#p PBE0/6-311G freq scrf=(cpcm,solvent=water)\n\ntitle\n")
+    assert cosmo_level(cosmo) == ("PBE0", "6-311G")
+
+
+def test_cosmo_level_none_when_no_route(tmp_path):
+    assert cosmo_level(tmp_path / "missing") is None

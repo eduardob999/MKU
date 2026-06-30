@@ -561,10 +561,13 @@ def run_gaussian_pipeline(model_id, geometry_dir, operation, *, cosmo=False, cha
         preopt_rows = None
 
     if preopt_rows is None:
+        ui.note("Running preopt benchmark — first time on this hardware profile "
+                f"({plan.cores} cores / {(bench_mem_mb or 0)//1024}GB); cached for next time.")
         preopt_rows = _run_preopt_benchmark(benchmark_dir, benchmark_sdf, mem, plan.nproc)
         best_preopt_row = _best_preopt_row(preopt_rows)
         hardware.store_benchmark_result(benchmark_preopt_key, preopt_rows, best_preopt_row["preopt_mode"])
     else:
+        ui.success("✓ Reusing cached preopt benchmark for this hardware (no re-run).")
         best_preopt_row = _best_preopt_row(preopt_rows)
 
     # Show the preopt comparison so "is preopt worth it?" is answerable at a glance:
@@ -604,6 +607,8 @@ def run_gaussian_pipeline(model_id, geometry_dir, operation, *, cosmo=False, cha
         successful = [row for row in cpu_rows if row["success"]]
         best_threads = min(successful, key=lambda row: row["run_seconds"])["threads"] if successful else plan.nproc
         hardware.store_benchmark_result(benchmark_cpu_key, cpu_rows, best_threads)
+    else:
+        ui.success("✓ Reusing cached CPU thread benchmark for this hardware (no re-run).")
 
     chosen_threads = hardware.get_cached_best_threads(benchmark_cpu_key) or plan.nproc
     ui.note(f"Benchmark complete. Cached preopt winner: {best_preopt_row['preopt_mode']}; CPU winner: {chosen_threads} threads")
@@ -1527,7 +1532,8 @@ def _run_marcus_reorganization(model_id, row, geometry_dir):
     resume), so the opt/freq jobs are never repeated. Saves λ / ΔG‡ as a DFT
     descriptor set so they can feed the model like any other feature.
     """
-    from ivette.core.marcus import available_pairs, compute_marcus, MARCUS_FEATURE_COLUMNS
+    from ivette.core.marcus import (available_pairs, compute_marcus, cosmo_level,
+                                     MARCUS_FEATURE_COLUMNS)
 
     render_header()
     cosmo_root = geometry_dir / "gaussian" / "opt_then_freq_COSMO"
@@ -1548,11 +1554,25 @@ def _run_marcus_reorganization(model_id, row, geometry_dir):
             "them and adds two single points each (the cross terms E_R^OG, E_O^RG); "
             "the opt+freq jobs are NOT repeated.")
 
-    # The single points must match the COSMO run's level of theory for the four
-    # energies to be comparable — defaults come from the gaussian-stage preset.
-    gp = configure_stage("gaussian")
+    # The single points MUST match the COSMO run's level of theory for the four
+    # energies to be comparable, so default to the level read straight from the
+    # COSMO route line. Offer to change it before the run; if you don't, it just
+    # runs unattended at the matched level.
+    detected = cosmo_level(cosmo_root)
+    gp = (P.GaussianParams(method=detected[0], basis_set=detected[1])
+          if detected else P.GaussianParams())
+    if detected:
+        ui.success(f"✓ Single points will match the COSMO run: {gp.method}/{gp.basis_set}.")
+    else:
+        ui.warn(f"Could not read the COSMO level from the logs — defaulting to "
+                f"{gp.method}/{gp.basis_set}. Verify it matches the opt+freq run.")
+    if ui.confirm("Change the level of theory / Gaussian options before running?",
+                  default=False):
+        gp = configure_stage("gaussian", base=gp)
+
     plan = hardware.recommend_gaussian_resources(len(cids))
-    ui.note("Single points are cheap; sizing per-job cores/memory:")
+    ui.note("Sizing the single points (they run in parallel like the opt+freq batch):")
+    jobs = ui.ask_int("Parallel single-point jobs", plan.jobs)
     nproc = ui.ask_int("Cores per single point (%nprocshared)", plan.nproc)
     mem = ui.ask_text("Memory per single point (%mem)", plan.mem)
 
@@ -1569,7 +1589,8 @@ def _run_marcus_reorganization(model_id, row, geometry_dir):
             prog.update(task, description=str(cid)[:38])
             prog.advance(task)
 
-        rows, _skipped = compute_marcus(cosmo_root, settings=settings, progress=_progress)
+        rows, _skipped = compute_marcus(cosmo_root, settings=settings, jobs=jobs,
+                                        progress=_progress)
 
     ok = [r for r in rows if r.get("reorg_energy_eV") is not None]
     failed = [r for r in rows if r.get("reorg_energy_eV") is None]
