@@ -39,9 +39,13 @@ from ivette.util.columns import is_target_column
 from ivette.util.text import slugify
 from ivette.core.modeling import (
     apply_transform,
-    cv_r2,
+    cluster_groups,
+    cross_conformal,
     decide_transform,
+    evaluate_cv,
     scaffold_groups,
+    select_features,
+    y_scramble,
 )
 
 
@@ -169,6 +173,9 @@ def build_model(tp=None):
         learning_rate=tp.learning_rate,
         subsample=tp.subsample,
         colsample_bytree=tp.colsample_bytree,
+        reg_alpha=tp.reg_alpha,
+        reg_lambda=tp.reg_lambda,
+        min_child_weight=tp.min_child_weight,
         objective="reg:squarederror",
         random_state=42,
         n_jobs=-1,
@@ -187,10 +194,12 @@ def train_target(
     smiles_col="SMILES",
     model_factory=None,
     tp=None,
+    fsp=None,
 ):
     # ``tp`` (TrainingParams) drives hyperparameters + CV/transform thresholds.
-    # ``model_factory`` overrides estimator construction when given (e.g. a
-    # small/fast model in tests); otherwise it is built from ``tp``.
+    # ``fsp`` (FeatureSelectionParams), when given, prunes the feature matrix
+    # per target before fitting. ``model_factory`` overrides estimator
+    # construction when given (e.g. a small/fast model in tests).
     from ivette.core.params import TrainingParams
 
     tp = tp or TrainingParams()
@@ -222,13 +231,34 @@ def train_target(
                                  dynamic_range=tp.log_dynamic_range)
     y = apply_transform(y_raw, transform)
 
-    # Scaffold-grouped CV so close analogs don't leak across folds.
-    groups = scaffold_groups(subset[smiles_col])
+    # Grouping for leakage-safe CV: scaffold (default) or cluster (within-family
+    # middle ground). 'cluster' still reports random alongside the grouped score.
+    if tp.cv_strategy == "cluster":
+        groups, cv_grouping, eval_strategy = cluster_groups(subset[smiles_col]), "cluster", "both"
+    else:
+        groups, cv_grouping, eval_strategy = scaffold_groups(subset[smiles_col]), "scaffold", tp.cv_strategy
+
+    # Optional per-target feature selection (e.g. the benchmark's best method).
+    selected_cols = list(feature_columns)
+    if fsp is not None:
+        X, selected_cols, _scores = select_features(X, y, fsp)
 
     model = model_factory()
 
-    cv_mean, cv_std, folds, cv_method = cv_r2(model_factory, X, y, groups,
-                                              max_folds=tp.cv_max_folds)
+    cv = evaluate_cv(model_factory, X, y, groups,
+                     strategy=eval_strategy, max_folds=tp.cv_max_folds,
+                     min_reliable_samples=tp.min_reliable_samples,
+                     n_repeats=tp.cv_repeats)
+
+    # Optional uncertainty + sanity check (opt-in to keep default training fast).
+    conformal_halfwidth = conformal_level = None
+    if tp.conformal:
+        conformal_halfwidth, conformal_level = cross_conformal(
+            model_factory, X, y, alpha=tp.conformal_alpha, max_folds=tp.cv_max_folds)
+    scramble_r2 = None
+    if tp.y_scramble_runs and tp.y_scramble_runs > 0:
+        scramble_r2 = y_scramble(model_factory, X, y,
+                                 n_repeats=tp.y_scramble_runs, max_folds=tp.cv_max_folds)
 
     model.fit(X, y)
 
@@ -238,10 +268,25 @@ def train_target(
         "target": target_col,
         "n_samples": int(n),
         "transform": transform,
-        "cv_method": cv_method,
-        "cv_folds": int(folds),
-        "cv_r2_mean": float(cv_mean),
-        "cv_r2_std": float(cv_std),
+        "fs_method": (fsp.method if fsp is not None else "none"),
+        "n_features": len(selected_cols),
+        "cv_strategy": tp.cv_strategy,
+        "cv_grouping": cv_grouping,
+        "cv_repeats": tp.cv_repeats,
+        "cv_method": cv["cv_method"],
+        "cv_folds": int(cv["cv_folds"] or 0),
+        "n_scaffold_groups": cv["n_scaffold_groups"],
+        "conformal_halfwidth": conformal_halfwidth,
+        "conformal_level": conformal_level,
+        "y_scramble_r2": scramble_r2,
+        # primary (honest scaffold score when available) for sorting/back-compat
+        "cv_r2_mean": float(cv["cv_r2_mean"]) if cv["cv_r2_mean"] is not None else float("nan"),
+        "cv_r2_std": float(cv["cv_r2_std"]) if cv["cv_r2_std"] is not None else 0.0,
+        # both splits reported side by side
+        "cv_r2_random": cv["cv_r2_random"],
+        "cv_r2_scaffold": cv["cv_r2_scaffold"],
+        "reliable": cv["reliable"],
+        "reliability_note": cv["reliability_note"],
         "train_r2": float(
             r2_score(y, pred)
         ),
@@ -311,16 +356,28 @@ def main(argv=None):
         help="JSON file of TrainingParams (radius, nbits, hyperparameters, …). "
              "Overrides --radius/--nbits when given.",
     )
+    parser.add_argument(
+        "--dft-csv",
+        default=None,
+        help="CSV of DFT/redox descriptors (CID + feature columns) to join as features.",
+    )
+    parser.add_argument(
+        "--fs-params-json",
+        default=None,
+        help="JSON file of FeatureSelectionParams applied per target before fitting.",
+    )
 
     args = parser.parse_args(argv)
 
     # Training configuration: a params JSON (from the UI) is the full source of
     # truth; otherwise fall back to --radius/--nbits with documented defaults.
-    from ivette.core.params import TrainingParams, from_dict
+    from ivette.core.params import TrainingParams, FeatureSelectionParams, from_dict
     if args.params_json:
         tp = from_dict(TrainingParams, json.load(open(args.params_json)))
     else:
         tp = TrainingParams(radius=args.radius, nbits=args.nbits)
+    fsp = from_dict(FeatureSelectionParams, json.load(open(args.fs_params_json))) \
+        if args.fs_params_json else None
     print(f"Training params: radius={tp.radius} nbits={tp.nbits} "
           f"n_estimators={tp.n_estimators} max_depth={tp.max_depth} "
           f"lr={tp.learning_rate} min_samples={tp.min_samples}")
@@ -336,6 +393,17 @@ def main(argv=None):
         raise ValueError(
             f"SMILES column '{args.smiles_col}' not found."
         )
+
+    # Join DFT/redox descriptors (added explicitly to the feature list below so
+    # column position never matters for their classification).
+    dft_feature_columns = []
+    if args.dft_csv and Path(args.dft_csv).exists():
+        dft_df = pd.read_csv(args.dft_csv)
+        dft_df["CID"] = dft_df["CID"].astype(str)
+        df["CID"] = df["CID"].astype(str)
+        dft_feature_columns = [c for c in dft_df.columns if c != "CID"]
+        df = df.merge(dft_df, on="CID", how="left")
+        print(f"  DFT/redox   : {len(dft_feature_columns)} features joined")
 
     print("\nClassifying columns...")
 
@@ -370,10 +438,12 @@ def main(argv=None):
         c for c in df.columns if c.startswith("eMFP_")
     ]
 
-    available_features = descriptor_features + fingerprint_features
+    available_features = descriptor_features + dft_feature_columns + fingerprint_features
 
     print(f"  Fingerprints: {len(fingerprint_features)}")
     print(f"  Total feats : {len(available_features)}")
+    if fsp is not None:
+        print(f"  Feature selection: {fsp.method} (k_best={fsp.k_best})")
     print(f"\nFound {len(targets)} usable targets")
 
     reports = []
@@ -388,6 +458,7 @@ def main(argv=None):
             available_features,
             smiles_col=args.smiles_col,
             tp=tp,
+            fsp=fsp,
         )
 
         if result is None:

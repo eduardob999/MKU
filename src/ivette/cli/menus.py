@@ -52,7 +52,6 @@ from ivette.util.storage import (
     save_dft_descriptor_set,
     load_dft_descriptor_set,
     dft_descriptor_sets_for_model,
-    add_dft_comparison,
     DFT_DESCRIPTORS,
 )
 
@@ -66,8 +65,10 @@ from ivette.core.download_physchem import (
 from ivette.core.find_thermo import main as find_thermo_main
 from ivette.core.train_pipeline import main as train_pipeline_main
 from ivette.core.download_training_sdfs import main as download_training_sdfs_main
-from ivette.core.parse_dft import parse_geometry_descriptors
-from ivette.core.dft_feature_test import compare_target_with_dft
+from ivette.core.parse_dft import parse_geometry_descriptors, parse_redox_descriptors
+from ivette.core.feature_benchmark import run_feature_selection_benchmark, best_method, best_config
+from ivette.core.hpo import optimize_training_params
+from ivette.util import presets
 from ivette.core import params as P
 from ivette.cli.params_ui import configure_stage
 
@@ -859,9 +860,35 @@ def generate_model_menu(dataset_id):
     params_json = output_dir / "training_params.json"
     params_json.write_text(json.dumps(P.to_dict(tp), indent=2))
 
+    # Optional: fold a DFT/redox descriptor set into the training features.
+    dft_csv = None
+    dft_sets = dft_descriptor_sets_for_model(model_id)
+    if dft_sets:
+        pick = ui.select(
+            "Include a DFT/redox descriptor set as features?",
+            [(f"{info['name']}  ({info.get('compound_count', '?')} compounds)", did)
+             for did, info in dft_sets]
+            + [("None — fingerprints + physchem only", None)],
+        )
+        if pick not in (ui.CANCEL, None):
+            _, ddf = load_dft_descriptor_set(pick)
+            dft_csv = output_dir / "dft_features.csv"
+            ddf.to_csv(dft_csv, index=False)
+            ui.info(f"Including {len([c for c in ddf.columns if c != 'CID'])} DFT/redox features "
+                    f"(covering {ddf['CID'].nunique()} compounds).")
+
+    # Optional: per-target feature selection (recommended with DFT / small data).
+    fs_json = None
+    if ui.confirm("Configure feature selection? (recommended for small data / many features)",
+                  default=bool(dft_csv)):
+        fsp = configure_stage("feature_selection")
+        fs_json = output_dir / "fs_params.json"
+        fs_json.write_text(json.dumps(P.to_dict(fsp), indent=2))
+
     parameters = {
         "radius": tp.radius, "nbits": tp.nbits,
         "training": P.to_dict(tp), "source_dataset": str(input_file),
+        "dft_features": bool(dft_csv),
     }
     register_model(dataset_id, name, parameters, output_dir)
 
@@ -873,6 +900,10 @@ def generate_model_menu(dataset_id):
         "--workdir", str(output_dir),  # keep training intermediates inside the model dir
         "--params-json", str(params_json),
     ]
+    if dft_csv:
+        argv += ["--dft-csv", str(dft_csv)]
+    if fs_json:
+        argv += ["--fs-params-json", str(fs_json)]
     try:
         train_pipeline_main(argv)
         ui.success("Model pipeline completed.")
@@ -934,7 +965,7 @@ def _dft_sets_for_geometry(geometry_dir):
 def _show_comparison_result(dft_id, comp):
     render_header()
     delta = comp["delta_cv_r2"]
-    verdict = "[success]DFT helps[/success]" if delta > 0 else "[warn]no CV gain[/warn]"
+    verdict = "[success]DFT helps[/success]" if (delta or 0) > 0 else "[warn]no CV gain[/warn]"
     ui.table(
         [("Metric", "muted"), ("Value", "white")],
         [
@@ -951,6 +982,34 @@ def _show_comparison_result(dft_id, comp):
         ],
         title="DFT feature value — CV comparison",
     )
+
+    # When available, show both CV splits (random = optimistic, scaffold =
+    # honest) plus a low-data flag. The random-minus-scaffold gap is the
+    # leakage meter that explains a big apparent drop.
+    if "baseline_cv_r2_random" in comp:
+        grouping = comp.get("grouping", "scaffold")
+
+        def _f(v):
+            return "n/a" if v is None else f"{v:+.4f}"
+
+        def _g(prefix):  # grouped value, with back-compat for old _scaffold entries
+            return comp.get(f"{prefix}_grouped", comp.get(f"{prefix}_scaffold"))
+
+        extra = [
+            ("Groups", comp.get("n_groups", comp.get("n_scaffold_groups", "?"))),
+            (f"Baseline R2  (random / {grouping})",
+             f"{_f(comp.get('baseline_cv_r2_random'))}  /  {_f(_g('baseline_cv_r2'))}"),
+            (f"With-DFT R2  (random / {grouping})",
+             f"{_f(comp.get('augmented_cv_r2_random'))}  /  {_f(_g('augmented_cv_r2'))}"),
+            (f"Delta R2  (random / {grouping})",
+             f"{_f(comp.get('delta_cv_r2_random'))}  /  {_f(_g('delta_cv_r2'))}"),
+        ]
+        if comp.get("reliable") is False:
+            extra.append(("Reliability",
+                          f"[warn]{comp.get('reliability_note', 'low data')} - scores unstable[/warn]"))
+        ui.table([("Metric", "muted"), ("Value", "white")], extra,
+                 title=f"Random vs {grouping} CV  (gap = leakage)")
+
     top = list(comp.get("dft_importance", {}).items())[:8]
     if top:
         ui.table(
@@ -961,17 +1020,15 @@ def _show_comparison_result(dft_id, comp):
     ui.pause()
 
 
-def _test_dft_features(model_id, row, geometry_dir):
-    """Compare CV R\u00b2 for this target with vs without the DFT descriptors."""
+def _benchmark_feature_selection(model_id, row, geometry_dir):
+    """Benchmark the selection methods (before/after DFT) and open the comparison plot."""
     render_header()
     sets = _dft_sets_for_geometry(geometry_dir)
-    if not sets:
-        ui.warn("No DFT descriptor set for this geometry set yet — run "
-                "'Parse DFT descriptors (freq results)' first.")
-        ui.pause()
-        return
-    dft_id, _ = sets[-1]
-    _, dft_df = load_dft_descriptor_set(dft_id)
+    dft_df = None
+    if sets:
+        _, dft_df = load_dft_descriptor_set(sets[-1][0])
+    else:
+        ui.note("No DFT/redox descriptor set found — benchmarking without the DFT block.")
 
     model_info = MODELS.get(model_id)
     params = model_info["parameters"]
@@ -980,7 +1037,6 @@ def _test_dft_features(model_id, row, geometry_dir):
         ui.error("Model source dataset not found.")
         ui.pause()
         return
-
     df = pd.read_csv(source)
     try:
         dataset = DATASETS.get(model_info.get("dataset_id"))
@@ -991,19 +1047,144 @@ def _test_dft_features(model_id, row, geometry_dir):
     except Exception:
         pass
 
-    ui.info(f"Comparing '{row['target']}' with vs without DFT descriptors (set {dft_id})…")
-    with ui.status("Training baseline and DFT-augmented models…"):
-        res = compare_target_with_dft(
-            df, row["target"], dft_df,
-            radius=params.get("radius", 2), nbits=params.get("nbits", 512),
-        )
+    grouping = ui.select(
+        "Group the cross-validation by:",
+        [
+            ("Cluster — predict new analogs of this family (recommended)", "cluster"),
+            ("Scaffold — novel-chemotype stress test", "scaffold"),
+        ],
+    )
+    if grouping is ui.CANCEL:
+        grouping = "cluster"
+
+    # Advanced options + presets for both the model and the selection sweep.
+    tp = configure_stage("training")
+    fsp = configure_stage("feature_selection")
+
+    ui.info(f"Benchmarking '{row['target']}' — all methods × before/after DFT, "
+            f"random vs {grouping} CV…")
+    with ui.status("Running the sweep — this trains several small models…"):
+        res = run_feature_selection_benchmark(df, row["target"], dft_df,
+                                              tp=tp, fsp=fsp, grouping=grouping)
     if "error" in res:
-        ui.warn(f"Cannot compare: {res['error']}")
+        ui.warn(f"Cannot benchmark: {res['error']}")
         ui.pause()
         return
-    comp_id, entry = add_dft_comparison(dft_id, res)
-    ui.success(f"Saved comparison {comp_id}.")
-    _show_comparison_result(dft_id, entry)
+
+    # Results table — method × (with/without DFT) → kept features + dual CV.
+    render_header()
+
+    def _r(v):
+        return "n/a" if v is None else f"{v:+.3f}"
+
+    table_rows = [(r["method"], r["block"].replace("_", " "), r["n_features"],
+                   _r(r.get("cv_r2_random")), _r(r.get("cv_r2_scaffold")))
+                  for r in res["results"]]
+    ui.table(
+        [("Method", "white"), ("Block", "muted"), ("Feats", "muted"),
+         ("R² random", "accent"), (f"R² {grouping}", "accent")],
+        table_rows,
+        title=f"Feature-selection benchmark — {row['target']}  "
+              f"(n={res['n_samples']}, {grouping} groups={res['n_groups']})",
+    )
+
+    out_dir = Path(model_info["output_dir"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    json_path = out_dir / f"feature_benchmark_{slugify(row['target'])}.json"
+    json_path.write_text(json.dumps(res, indent=2))
+
+    # Offer to bake the winning method into a feature-selection preset, which
+    # the training menu can then load — wiring "best method" into training.
+    winner = best_method(res)
+    if winner:
+        ui.success(f"Best method (by {grouping} CV): {winner}")
+        if ui.confirm(f"Save '{winner}' as a feature-selection preset to reuse in training?",
+                      default=True):
+            pname = ui.ask_text("Preset name", "best")
+            if pname:
+                presets.save_preset("feature_selection", pname, P.to_dict(best_config(res)))
+                ui.success(f"Saved preset '{pname}'. Load it in training → feature selection.")
+
+    ui.note("Opening comparison plot — close it to return…")
+    _launch([sys.executable, str(_REPO_ROOT / "scripts" / "feature_benchmark_plot.py"),
+             str(json_path)], what="feature benchmark plot")
+    ui.pause()
+
+
+def _optimize_training_params(model_id, row, geometry_dir):
+    """Bayesian (Optuna) search over the XGBoost hyperparameters for this target."""
+    render_header()
+    model_info = MODELS.get(model_id)
+    params = model_info["parameters"]
+    source = params.get("source_dataset")
+    if not source or not Path(source).exists():
+        ui.error("Model source dataset not found.")
+        ui.pause()
+        return
+    df = pd.read_csv(source)
+    try:
+        dataset = DATASETS.get(model_info.get("dataset_id"))
+        _, comp = load_compound_library(dataset["compound_id"])
+        smiles = comp[["CID", "SMILES"]].drop_duplicates("CID").astype({"CID": str})
+        df["CID"] = df["CID"].astype(str)
+        df = df.merge(smiles, on="CID", how="left")
+    except Exception:
+        pass
+
+    # Optionally fold in the same DFT/redox features + selection you'll train on,
+    # so the search optimizes the real feature matrix.
+    sets = _dft_sets_for_geometry(geometry_dir)
+    dft_df = None
+    if sets and ui.confirm("Include the latest DFT/redox descriptor set as features?",
+                           default=True):
+        _, dft_df = load_dft_descriptor_set(sets[-1][0])
+
+    grouping = ui.select(
+        "Optimize the CV score grouped by:",
+        [
+            ("Cluster — predict new analogs of this family (recommended)", "cluster"),
+            ("Scaffold — novel-chemotype stress test", "scaffold"),
+        ],
+    )
+    if grouping is ui.CANCEL:
+        grouping = "cluster"
+
+    base_tp = configure_stage("training")
+    fsp = None
+    if ui.confirm("Apply a feature-selection config during the search?",
+                  default=dft_df is not None):
+        fsp = configure_stage("feature_selection")
+    n_trials = ui.ask_int("Number of search trials (more = better, slower)", 50)
+
+    ui.info(f"Optimizing XGBoost hyperparameters for '{row['target']}' "
+            f"({grouping} CV, {n_trials} trials)…")
+    with ui.status("Bayesian search (Optuna TPE) — running many quick trainings…"):
+        res = optimize_training_params(df, row["target"], dft_df,
+                                       base_tp=base_tp, fsp=fsp,
+                                       n_trials=n_trials, grouping=grouping)
+    if "error" in res:
+        ui.warn(f"Cannot optimize: {res['error']}")
+        ui.pause()
+        return
+
+    render_header()
+    ui.table(
+        [("Parameter", "accent"), ("Optimized value", "white")],
+        [(k, str(v)) for k, v in res["tuned"].items()],
+        title=f"Best hyperparameters — {row['target']}  "
+              f"(best {grouping} CV R² = {res['best_score']:+.4f}, "
+              f"n={res['n_samples']}, trials={res['n_trials']})",
+    )
+    if res["n_samples"] < base_tp.min_reliable_samples:
+        ui.warn(f"n={res['n_samples']} is small — the 'best' config can be tuned to "
+                "CV noise. Treat the improvement cautiously.")
+
+    if ui.confirm("Save these optimized parameters as a training preset?", default=True):
+        pname = ui.ask_text("Preset name", "optimized")
+        if pname:
+            presets.save_preset("training", pname, res["best_params"])
+            ui.success(f"Saved preset '{pname}'. Load it in training → Advanced options.")
+    ui.pause()
 
 
 def _dft_comparisons_menu(model_id, row, geometry_dir):
@@ -1012,7 +1193,7 @@ def _dft_comparisons_menu(model_id, row, geometry_dir):
         sets = _dft_sets_for_geometry(geometry_dir)
         comparisons = [(d, c) for d, info in sets for c in info.get("comparisons", [])]
         if not comparisons:
-            ui.note("No comparisons yet — run 'Test DFT features (CV comparison)' first.")
+            ui.note("No saved comparisons — run 'Benchmark feature selection + DFT' first.")
             ui.pause()
             return
         choices = [ui.section("Comparisons")]
@@ -1142,6 +1323,46 @@ def _create_dft_descriptor_set(model_id, row, geometry_dir):
     ui.pause()
 
 
+def _create_redox_descriptor_set(model_id, row, geometry_dir):
+    """Parse the COSMO neutral+anion runs into a redox descriptor set.
+
+    Produces neutral_*, anion_*, and delta_* (ΔG/ΔH/ΔS of reduction, etc.)
+    features for every compound completed in both charge states.
+    """
+    render_header()
+    cosmo_root = geometry_dir / "gaussian" / "opt_then_freq_COSMO"
+    if not cosmo_root.exists():
+        ui.warn("No COSMO results here — run "
+                "'Run opt+freq with COSMO (neutral + anion)' first.")
+        ui.pause()
+        return
+    rows = parse_redox_descriptors(cosmo_root)
+    if not rows:
+        ui.warn("No compounds completed in BOTH neutral and anion states yet "
+                "(a redox feature needs both).")
+        ui.pause()
+        return
+    ui.info(f"Parsed {len(rows)} compounds with neutral / anion / Δ features.")
+    name = ui.ask_text("Redox descriptor set name", f"{row['target']} redox")
+    if not name:
+        ui.warn("Cancelled.")
+        ui.pause()
+        return
+    geometry_id = next(
+        (k for k, v in GEOMETRIES.items() if Path(v["output_dir"]) == geometry_dir),
+        None,
+    )
+    with ui.status("Saving descriptor set…"):
+        dft_id, df = save_dft_descriptor_set(
+            rows, name, model_id, row["target"], geometry_id,
+            parameters={"source_cosmo": str(cosmo_root), "kind": "redox"},
+        )
+    n_props = len([c for c in df.columns if c != "CID"])
+    ui.success(f"Created redox descriptor set '{name}'  ({dft_id}) — "
+               f"{len(df)} compounds × {n_props} features")
+    ui.pause()
+
+
 def show_dft_descriptor_set(dft_id):
     info = DFT_DESCRIPTORS.get(dft_id)
     context.mode = "DFT Descriptor Set"
@@ -1182,8 +1403,10 @@ def geometry_set_menu(model_id, row, geometry_dir):
                 ("Run Gaussian single point", "sp"),
                 ui.section("DFT analysis"),
                 ("Parse DFT descriptors (freq results)", "dft"),
-                ("Test DFT features (CV comparison)", "dfttest"),
-                ("DFT comparison results", "dftresults"),
+                ("Parse COSMO redox descriptors (neutral / anion / Δ)", "redox"),
+                ("Benchmark feature selection + DFT (random vs cluster/scaffold)", "fsbench"),
+                ("Optimize training parameters (Bayesian sweep)", "hpo"),
+                ("DFT comparison results (history)", "dftresults"),
                 ui.section("Manage"),
                 ("Delete Geometry set", "delete"),
                 ("← Back", "back"),
@@ -1202,8 +1425,12 @@ def geometry_set_menu(model_id, row, geometry_dir):
             run_gaussian_pipeline(model_id, geometry_dir, operation="sp")
         elif action == "dft":
             _create_dft_descriptor_set(model_id, row, geometry_dir)
-        elif action == "dfttest":
-            _test_dft_features(model_id, row, geometry_dir)
+        elif action == "redox":
+            _create_redox_descriptor_set(model_id, row, geometry_dir)
+        elif action == "fsbench":
+            _benchmark_feature_selection(model_id, row, geometry_dir)
+        elif action == "hpo":
+            _optimize_training_params(model_id, row, geometry_dir)
         elif action == "dftresults":
             _dft_comparisons_menu(model_id, row, geometry_dir)
         elif action == "delete":

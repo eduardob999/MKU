@@ -48,6 +48,18 @@ def main(argv=None):
         help="JSON file of TrainingParams forwarded to the trainer."
     )
 
+    parser.add_argument(
+        "--dft-csv",
+        default=None,
+        help="CSV of DFT/redox descriptors forwarded to the trainer."
+    )
+
+    parser.add_argument(
+        "--fs-params-json",
+        default=None,
+        help="JSON file of FeatureSelectionParams forwarded to the trainer."
+    )
+
     args = parser.parse_args(argv)
 
 
@@ -233,6 +245,10 @@ def main(argv=None):
 
     if args.params_json:
         train_argv += ["--params-json", args.params_json]
+    if args.dft_csv:
+        train_argv += ["--dft-csv", args.dft_csv]
+    if args.fs_params_json:
+        train_argv += ["--fs-params-json", args.fs_params_json]
 
     train_xgboost_main(train_argv)
 

@@ -19,14 +19,17 @@ from ivette.core.train_xgboost_emfp import (
 )
 from ivette.core.modeling import (
     apply_transform,
-    cv_r2,
+    cluster_groups,
     decide_transform,
+    evaluate_cv,
     scaffold_groups,
+    select_features,
 )
 
 
 def compare_target_with_dft(source, target, dft_df, *,
-                            smiles_col="SMILES", radius=2, nbits=512):
+                            smiles_col="SMILES", radius=2, nbits=512, fsp=None,
+                            grouping="cluster", model_factory=None):
     """Return a dict comparing baseline vs DFT-augmented CV R² for ``target``.
 
     ``source`` is the model's training data (a DataFrame, or a CSV path) which
@@ -66,14 +69,26 @@ def compare_target_with_dft(source, target, dft_df, *,
     n_covered = int(joined.notna().any(axis=1).sum())
     augmented = pd.concat([base.reset_index(drop=True), joined], axis=1)
 
-    # Same scaffold-grouped folds for both models so the comparison is fair and
-    # not inflated by analog leakage.
-    groups = scaffold_groups(sub[smiles_col])
-    base_r2, base_std, folds, cv_method = cv_r2(build_model, base, y, groups)
-    aug_r2, aug_std, _, _ = cv_r2(build_model, augmented, y, groups)
+    # Optional feature selection (e.g. the benchmark's best method), applied to
+    # each matrix so the comparison reflects the same selection the model uses.
+    if fsp is not None:
+        base = select_features(base, y, fsp)[0]
+        augmented = select_features(augmented, y, fsp)[0]
+
+    # Evaluate under random + the chosen grouping. cluster (default) = "predict
+    # new analogs of this family"; scaffold = novel-chemotype stress test. The
+    # random-vs-grouped gap is the leakage / over-fit meter.
+    mf = model_factory or build_model
+    groups = (cluster_groups(sub[smiles_col]) if grouping == "cluster"
+              else scaffold_groups(sub[smiles_col]))
+    base = evaluate_cv(mf, base, y, groups, strategy="both")
+    aug = evaluate_cv(mf, augmented, y, groups, strategy="both")
+
+    def _delta(a, b):
+        return None if (a is None or b is None) else (a - b)
 
     # importance share of the DFT block in the augmented model
-    model = build_model()
+    model = mf()
     model.fit(augmented, y)
     imp = pd.Series(model.feature_importances_, index=augmented.columns)
     dft_imp = imp[dft_cols].sort_values(ascending=False)
@@ -83,13 +98,24 @@ def compare_target_with_dft(source, target, dft_df, *,
         "n_samples": n,
         "n_dft_covered": n_covered,
         "transform": transform,
-        "cv_method": cv_method,
-        "cv_folds": folds,
-        "baseline_cv_r2": base_r2,
-        "baseline_cv_std": base_std,
-        "augmented_cv_r2": aug_r2,
-        "augmented_cv_std": aug_std,
-        "delta_cv_r2": aug_r2 - base_r2,
+        "grouping": grouping,
+        "cv_folds": base["cv_folds"],
+        "n_groups": base["n_scaffold_groups"],
+        "reliable": base["reliable"],
+        "reliability_note": base["reliability_note"],
+        # primary (grouped = honest within-family score when grouping=cluster)
+        "baseline_cv_r2": base["cv_r2_mean"],
+        "baseline_cv_std": base["cv_r2_std"] or 0.0,
+        "augmented_cv_r2": aug["cv_r2_mean"],
+        "augmented_cv_std": aug["cv_r2_std"] or 0.0,
+        "delta_cv_r2": _delta(aug["cv_r2_mean"], base["cv_r2_mean"]),
+        # random vs grouped, side by side
+        "baseline_cv_r2_random": base["cv_r2_random"],
+        "baseline_cv_r2_grouped": base["cv_r2_scaffold"],
+        "augmented_cv_r2_random": aug["cv_r2_random"],
+        "augmented_cv_r2_grouped": aug["cv_r2_scaffold"],
+        "delta_cv_r2_random": _delta(aug["cv_r2_random"], base["cv_r2_random"]),
+        "delta_cv_r2_grouped": _delta(aug["cv_r2_scaffold"], base["cv_r2_scaffold"]),
         "dft_total_importance": float(imp[dft_cols].sum()),
         "dft_importance": {k: float(v) for k, v in dft_imp.items()},
     }

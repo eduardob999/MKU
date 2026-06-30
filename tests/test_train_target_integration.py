@@ -76,6 +76,20 @@ def test_build_model_uses_training_params():
     assert p["learning_rate"] == 0.5
 
 
+def test_train_target_applies_feature_selection():
+    from ivette.core.params import FeatureSelectionParams
+    df = _make_frame(n=80, signed=True)
+    rng = np.random.default_rng(9)
+    for i in range(20):
+        df[f"x{i}"] = rng.normal(size=len(df))
+    feats = ["feat_1", "feat_2"] + [f"x{i}" for i in range(20)]
+    fsp = FeatureSelectionParams(method="univariate", k_best=5,
+                                 variance_threshold=0.0, correlation_threshold=1.0)
+    _m, report, _imp = train_target(df, "target", feats, model_factory=_fast_model, fsp=fsp)
+    assert report["n_features"] == 5            # selection cut 22 -> 5
+    assert report["fs_method"] == "univariate"
+
+
 def test_train_target_honors_tp_min_samples():
     from ivette.core.params import TrainingParams
     df = _make_frame(n=40, signed=True)

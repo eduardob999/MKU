@@ -8,7 +8,11 @@ import os
 
 import pytest
 
-from ivette.core.parse_dft import parse_freq_log, parse_geometry_descriptors
+from ivette.core.parse_dft import (
+    parse_freq_log,
+    parse_geometry_descriptors,
+    parse_redox_descriptors,
+)
 
 
 def test_parse_freq_log_extracts_all_descriptors(tmp_path, freq_log_text):
@@ -70,3 +74,34 @@ def test_parse_geometry_descriptors_dedups_by_cid_keeping_newest(tmp_path, freq_
     assert len(rows) == 1
     assert rows[0]["CID"] == "555"
     assert rows[0]["scf_energy"] == pytest.approx(-154.999999999)
+
+
+def test_parse_redox_descriptors_neutral_anion_delta(tmp_path, freq_log_text):
+    cosmo = tmp_path / "opt_then_freq_COSMO"
+    (cosmo / "neutral" / "555").mkdir(parents=True)
+    (cosmo / "anion" / "555").mkdir(parents=True)
+    (cosmo / "neutral" / "555" / "555_freq.log").write_text(freq_log_text)
+    # Shift the anion's Gibbs free energy so the delta is nonzero and known.
+    anion_text = freq_log_text.replace("-154.150000", "-154.100000")
+    (cosmo / "anion" / "555" / "555_freq.log").write_text(anion_text)
+
+    rows = parse_redox_descriptors(cosmo)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["CID"] == "555"
+    assert r["neutral_gibbs_G"] == pytest.approx(-154.150000)
+    assert r["anion_gibbs_G"] == pytest.approx(-154.100000)
+    # ΔG of reduction = anion - neutral
+    assert r["delta_gibbs_G"] == pytest.approx(0.050000, abs=1e-6)
+    # neutral/anion present for all descriptors; delta present for thermo ones
+    for col in ("neutral_enthalpy_H", "anion_enthalpy_H", "delta_enthalpy_H",
+                "neutral_entropy_S", "anion_entropy_S", "delta_entropy_S"):
+        assert col in r
+
+
+def test_parse_redox_requires_both_states(tmp_path, freq_log_text):
+    cosmo = tmp_path / "opt_then_freq_COSMO"
+    (cosmo / "neutral" / "555").mkdir(parents=True)
+    (cosmo / "neutral" / "555" / "555_freq.log").write_text(freq_log_text)
+    # No anion computed → no redox row (a delta needs both states).
+    assert parse_redox_descriptors(cosmo) == []

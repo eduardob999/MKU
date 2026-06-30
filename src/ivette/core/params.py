@@ -83,7 +83,7 @@ class TrainingParams:
     radius: int = field(
         default=2, metadata={"help": "Morgan fingerprint radius"})
     nbits: int = field(
-        default=512, metadata={"help": "Fingerprint length (bits)"})
+        default=256, metadata={"help": "Fingerprint length (bits) — smaller suits small datasets"})
     n_estimators: int = field(
         default=500, metadata={"help": "XGBoost: number of trees"})
     max_depth: int = field(
@@ -94,13 +94,54 @@ class TrainingParams:
         default=0.8, metadata={"help": "XGBoost: row subsample fraction"})
     colsample_bytree: float = field(
         default=0.8, metadata={"help": "XGBoost: feature subsample fraction per tree"})
+    reg_alpha: float = field(
+        default=0.0, metadata={"help": "XGBoost: L1 regularization (higher = simpler model)"})
+    reg_lambda: float = field(
+        default=1.0, metadata={"help": "XGBoost: L2 regularization (higher = simpler model)"})
+    min_child_weight: float = field(
+        default=1.0, metadata={"help": "XGBoost: min child weight (higher = more conservative)"})
     min_samples: int = field(
         default=30, metadata={"help": "Minimum samples required to train a target"})
     cv_max_folds: int = field(
         default=5, metadata={"help": "Maximum cross-validation folds"})
+    cv_repeats: int = field(
+        default=1, metadata={"help": "Repeat CV N times and average (reduces variance on small data)"})
     log_dynamic_range: float = field(
         default=1000.0,
         metadata={"help": "Positive target max/min spread above which to log-transform"})
+    cv_strategy: str = field(
+        default="both",
+        metadata={"help": "Which CV score(s) to report (cluster = within-family middle ground)",
+                  "choices": ["both", "scaffold", "random", "cluster"]})
+    min_reliable_samples: int = field(
+        default=50,
+        metadata={"help": "Below this sample count a target's CV score is flagged unreliable"})
+    conformal: bool = field(
+        default=False,
+        metadata={"help": "Also report a conformal prediction interval half-width"})
+    conformal_alpha: float = field(
+        default=0.2, metadata={"help": "Conformal miscoverage (0.2 → 80% intervals)"})
+    y_scramble_runs: int = field(
+        default=0, metadata={"help": "Y-scramble sanity-check repeats (0 = off; ~5 recommended)"})
+
+
+@dataclass
+class FeatureSelectionParams:
+    method: str = field(
+        default="model",
+        metadata={"help": "Main selector applied after the filters",
+                  "choices": ["none", "univariate", "model"]})
+    k_best: int = field(
+        default=50, metadata={"help": "Max features the selector keeps (0 = keep all)"})
+    score_func: str = field(
+        default="mutual_info",
+        metadata={"help": "Univariate scoring function",
+                  "choices": ["mutual_info", "f_regression"]})
+    variance_threshold: float = field(
+        default=0.0, metadata={"help": "Drop features with variance below this (0 = off)"})
+    correlation_threshold: float = field(
+        default=0.95,
+        metadata={"help": "Drop one of any feature pair above this |correlation| (1 = off)"})
 
 
 # ── Stage registry ───────────────────────────────────────────────────────────
@@ -112,6 +153,7 @@ STAGES: dict[str, tuple[str, type]] = {
     "dataset": ("Property dataset", DatasetParams),
     "gaussian": ("Gaussian / DFT", GaussianParams),
     "training": ("Model training", TrainingParams),
+    "feature_selection": ("Feature selection", FeatureSelectionParams),
 }
 
 

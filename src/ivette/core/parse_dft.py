@@ -78,19 +78,58 @@ def parse_freq_log(path):
     }
 
 
-def parse_geometry_descriptors(gaussian_root):
-    """Per-CID descriptor rows for every completed freq log under ``gaussian_root``.
+def _descriptors_by_cid(root):
+    """``{cid: {descriptor: value}}`` for every completed freq log under ``root``.
 
     Deduplicates by CID, keeping the most recently modified frequency log (so a
     re-run or a different operation supersedes the older result).
     """
     by_cid = {}
-    logs = sorted(Path(gaussian_root).rglob("*_freq.log"),
-                  key=lambda p: p.stat().st_mtime)
-    for log in logs:
+    for log in sorted(Path(root).rglob("*_freq.log"), key=lambda p: p.stat().st_mtime):
         cid = log.stem.replace("_freq", "")
         row = parse_freq_log(log)
         if row is None:
             continue
-        by_cid[cid] = {"CID": cid, **{c: row.get(c) for c in DESCRIPTOR_COLUMNS}}
-    return list(by_cid.values())
+        by_cid[cid] = {c: row.get(c) for c in DESCRIPTOR_COLUMNS}
+    return by_cid
+
+
+def parse_geometry_descriptors(gaussian_root):
+    """Per-CID descriptor rows for every completed freq log under ``gaussian_root``."""
+    return [{"CID": cid, **row} for cid, row in _descriptors_by_cid(gaussian_root).items()]
+
+
+# Descriptors for which an anion - neutral difference is physically meaningful.
+# delta_gibbs_G = Gibbs energy of reduction; delta_enthalpy_H, delta_entropy_S
+# similarly; delta_scf_energy ≈ adiabatic electron affinity (in solution).
+REDOX_DELTA_COLUMNS = [
+    "scf_energy", "zpe_correction", "thermal_corr_E", "thermal_corr_H",
+    "thermal_corr_G", "E_plus_zpe", "enthalpy_H", "gibbs_G", "entropy_S",
+]
+
+
+def parse_redox_descriptors(cosmo_root, *, neutral_label="neutral", anion_label="anion"):
+    """Per-CID redox features from a COSMO neutral+anion run.
+
+    ``cosmo_root`` is the ``.../gaussian/opt_then_freq_COSMO`` directory holding
+    ``neutral/`` and ``anion/`` subtrees. For every compound completed in *both*
+    states, emit one row with ``neutral_<d>`` and ``anion_<d>`` for each
+    descriptor plus ``delta_<d> = anion - neutral`` for the thermodynamic ones
+    (the reduction enthalpy/entropy/Gibbs/electron-affinity terms).
+    """
+    root = Path(cosmo_root)
+    neutral = _descriptors_by_cid(root / neutral_label)
+    anion = _descriptors_by_cid(root / anion_label)
+
+    rows = []
+    for cid in sorted(set(neutral) & set(anion)):
+        n, a = neutral[cid], anion[cid]
+        row = {"CID": cid}
+        for c in DESCRIPTOR_COLUMNS:
+            row[f"neutral_{c}"] = n.get(c)
+            row[f"anion_{c}"] = a.get(c)
+        for c in REDOX_DELTA_COLUMNS:
+            nv, av = n.get(c), a.get(c)
+            row[f"delta_{c}"] = (av - nv) if (nv is not None and av is not None) else None
+        rows.append(row)
+    return rows

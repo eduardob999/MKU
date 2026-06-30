@@ -18,6 +18,7 @@ matplotlib>=3.8
 # Machine learning
 scikit-learn>=1.5
 xgboost>=2.1
+optuna>=3.6
 
 # Model persistence
 joblib>=1.4
