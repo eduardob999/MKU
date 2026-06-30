@@ -221,3 +221,32 @@ def describe(params) -> "list[FieldInfo]":
             choices=f.metadata.get("choices"),
         ))
     return out
+
+
+def _fmt_value(value) -> str:
+    if isinstance(value, (list, tuple)):
+        return " ".join(str(v) for v in value)
+    return str(value)
+
+
+def format_defaults() -> str:
+    """Plain-text dump of every stage's default parameters (UI-agnostic).
+
+    Generated from the dataclasses, so it can never drift from the actual
+    defaults. Rendered by the CLI's Configuration view and by
+    ``python -m ivette.core.params`` / ``python ivette.py --show-defaults``.
+    """
+    lines = ["Ivette default parameters  (source of truth: ivette/core/params.py)", ""]
+    for key, (title, cls) in STAGES.items():
+        infos = describe(cls())
+        lines.append(f"[{key}]  {title}")
+        width = max((len(fi.name) for fi in infos), default=0)
+        for fi in infos:
+            choices = f"  (choices: {', '.join(map(str, fi.choices))})" if fi.choices else ""
+            lines.append(f"  {fi.name:<{width}} = {_fmt_value(fi.value):<10}  # {fi.help}{choices}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":   # python -m ivette.core.params
+    print(format_defaults())

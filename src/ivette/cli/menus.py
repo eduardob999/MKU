@@ -524,10 +524,15 @@ def run_gaussian_pipeline(model_id, geometry_dir, operation, *, cosmo=False, cha
     mem = ui.ask_text("Memory per job (%mem)", plan.mem)
 
     ui.rule(f"Gaussian: {operation}{' + COSMO' if cosmo else ''}")
+    # Key the benchmark cache on TOTAL memory, not currently-available memory:
+    # free RAM fluctuates between runs, so using it would change the key every
+    # time and force the (expensive nitrobenzene) benchmark to re-run. Total RAM
+    # is a stable property of the machine, so the cached result is reused.
+    bench_mem_mb = hardware.total_memory_mb()
     benchmark_key = hardware.benchmark_key(
         stage="tensor",
         cores=plan.cores,
-        available_mem_mb=hardware.available_memory_mb(),
+        available_mem_mb=bench_mem_mb,
         job_label="nitrobenzene",
     )
     benchmark_dir = GAUSSIAN_BENCHMARK_RUN_DIR / benchmark_key.replace(";", "_")
@@ -538,12 +543,12 @@ def run_gaussian_pipeline(model_id, geometry_dir, operation, *, cosmo=False, cha
 
     benchmark_preopt_key = hardware.preopt_benchmark_key(
         cores=plan.cores,
-        available_mem_mb=hardware.available_memory_mb(),
+        available_mem_mb=bench_mem_mb,
         fixed_threads=plan.nproc,
     )
     benchmark_cpu_key = hardware.thread_benchmark_key(
         cores=plan.cores,
-        available_mem_mb=hardware.available_memory_mb(),
+        available_mem_mb=bench_mem_mb,
         preopt="winner",
     )
 
@@ -585,7 +590,7 @@ def run_gaussian_pipeline(model_id, geometry_dir, operation, *, cosmo=False, cha
     if cpu_rows is None:
         benchmark_threads = hardware.benchmark_thread_plan(
             plan.cores,
-            available_mem_mb=hardware.available_memory_mb(),
+            available_mem_mb=bench_mem_mb,
             operation="opt then freq",
             job_label="nitrobenzene",
         )
@@ -2295,6 +2300,87 @@ def reports_menu():
             _launch_control_room()
 
 
+def _fmt_param(value):
+    if isinstance(value, (list, tuple)):
+        return " ".join(str(v) for v in value)
+    return str(value)
+
+
+def _defaults_table(stage_key):
+    """Render one stage's default parameters (read-only) from params.describe()."""
+    title, cls = P.STAGES[stage_key]
+    infos = P.describe(cls())
+    ui.table(
+        [("Parameter", "accent"), ("Default", "white"), ("Description", "muted")],
+        [(fi.name, _fmt_param(fi.value), fi.help) for fi in infos],
+        title=f"{title}   [{stage_key}]",
+    )
+
+
+def _show_all_defaults():
+    render_header()
+    for key in P.STAGES:
+        _defaults_table(key)
+    ui.pause()
+
+
+def _stage_config_menu(stage_key):
+    title, _cls = P.STAGES[stage_key]
+    while True:
+        render_header()
+        _defaults_table(stage_key)
+        names = presets.list_presets(stage_key)
+        if names:
+            ui.table([("Saved preset", "white")], [(n,) for n in names],
+                     title=f"Presets — {title}")
+        action = ui.select(
+            f"{title} — configuration",
+            [
+                ("Manage presets / inspect values (opens editor)", "edit"),
+                ("← Back", "back"),
+            ],
+        )
+        if action is ui.CANCEL or action == "back":
+            return
+        if action == "edit":
+            # Reuse the stage editor for preset curation; the returned values are
+            # transient here (defaults themselves live in code), so we discard them.
+            configure_stage(stage_key)
+
+
+def configuration_menu():
+    """Read-only overview of every default parameter, plus per-stage preset curation.
+
+    The defaults themselves live in :mod:`ivette.core.params` (the single source of
+    truth); this view is generated from it via ``describe()`` so it can never drift.
+    """
+    while True:
+        context.mode = "Configuration"
+        context.active_set = context.active_compound_set = context.active_run = None
+        context.info = {}
+        render_header()
+        ui.note("Defaults live in core/params.py (single source of truth). Read-only here — "
+                "change values per run via a stage's Advanced options, or save a named preset.")
+        choices = [ui.section("Parameter stages")]
+        for key, (title, cls) in P.STAGES.items():
+            nparams = len(P.describe(cls()))
+            npresets = len(presets.list_presets(key))
+            choices.append((f"{title}  ({nparams} params · {npresets} presets)", key))
+        choices += [
+            ui.section(""),
+            ("Show ALL defaults on one screen", "all"),
+            ("← Back", "back"),
+        ]
+        action = ui.select("Configuration — defaults & presets", choices)
+        if action is ui.CANCEL or action == "back":
+            context.clear()
+            return
+        if action == "all":
+            _show_all_defaults()
+        else:
+            _stage_config_menu(action)
+
+
 def main():
     ensure_storage()
     applog.configure()
@@ -2327,6 +2413,7 @@ def _run_main_loop(log):
             choices.append(ui.section("Actions"))
             choices.append(("＋ Generate new structure library", ("new", None)))
             choices.append(("📊 Results & Reports", ("reports", None)))
+            choices.append(("⚙ Configuration (defaults & presets)", ("config", None)))
             choices.append(("✕ Exit", ("exit", None)))
 
             choice = ui.select("Structure libraries", choices)
@@ -2340,3 +2427,5 @@ def _run_main_loop(log):
                 generate_structure_library_menu()
             elif action == "reports":
                 reports_menu()
+            elif action == "config":
+                configuration_menu()

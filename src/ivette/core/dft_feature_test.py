@@ -28,7 +28,10 @@ from ivette.core.modeling import (
 
 
 def compare_target_with_dft(source, target, dft_df, *,
-                            smiles_col="SMILES", radius=2, nbits=512, fsp=None,
+                            # Fallbacks mirror TrainingParams (radius/nbits); the CLI
+                            # always passes the live training params, so these only
+                            # apply to direct callers.
+                            smiles_col="SMILES", radius=2, nbits=256, fsp=None,
                             grouping="cluster", cluster_cutoff=0.4,
                             cluster_fp_radius=2, cluster_fp_bits=1024, model_factory=None):
     """Return a dict comparing baseline vs DFT-augmented CV R² for ``target``.
