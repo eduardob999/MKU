@@ -49,9 +49,15 @@ from ivette.util.storage import (
     datasets_for_compound,
     update_dataset_status,
     load_dataset_info,
+    register_or_update_calculation_set,
+    find_calculation_set,
+    calculation_sets_for_geometry,
+    add_dft_comparison,
     save_dft_descriptor_set,
     load_dft_descriptor_set,
     dft_descriptor_sets_for_model,
+    dft_descriptor_sets_for_calc,
+    CALCULATIONS,
     DFT_DESCRIPTORS,
 )
 
@@ -67,6 +73,7 @@ from ivette.core.train_pipeline import main as train_pipeline_main
 from ivette.core.download_training_sdfs import main as download_training_sdfs_main
 from ivette.core.parse_dft import parse_geometry_descriptors, parse_redox_descriptors
 from ivette.core.feature_benchmark import run_feature_selection_benchmark, best_method, best_config
+from ivette.core.dft_feature_test import compare_target_with_dft
 from ivette.core.hpo import optimize_training_params
 from ivette.util import presets
 from ivette.core import params as P
@@ -669,6 +676,23 @@ def run_gaussian_pipeline(model_id, geometry_dir, operation, *, cosmo=False, cha
         on_state_start=_on_state_start,
         on_state_done=_on_state_done,
     )
+
+    # Register (or update) this run as a Calculation set so it can be selected
+    # for DFT analysis later. One set per operation type on this geometry.
+    if operation.strip().lower() == "sp":
+        kind, set_name = "sp", "Single point" + (" + COSMO" if cosmo else "")
+    elif cosmo:
+        kind, set_name = "cosmo", f"{operation} + COSMO (neutral + anion)"
+    else:
+        kind, set_name = "opt_freq", operation
+    geometry_id = _geometry_id_for(geometry_dir)
+    ginfo = GEOMETRIES.get(geometry_id) or {}
+    register_or_update_calculation_set(
+        model_id=model_id, target=ginfo.get("target"), geometry_id=geometry_id,
+        name=set_name, kind=kind, operation=operation, cosmo=cosmo,
+        charge_states=charge_states, output_dir=str(gaussian_root),
+        parameters={"method": gp.method, "basis_set": gp.basis_set},
+    )
     ui.pause()
 
 
@@ -962,6 +986,28 @@ def _dft_sets_for_geometry(geometry_dir):
             if info.get("geometry_id") == gid]
 
 
+def _load_model_source_df(model_id):
+    """The model's training CSV with the SMILES column merged in, or None.
+
+    Shared by the modeling tools (FS benchmark, Bayesian sweep, DFT comparison)
+    so they all assemble the same feature source the same way.
+    """
+    model_info = MODELS.get(model_id) or {}
+    source = model_info.get("parameters", {}).get("source_dataset")
+    if not source or not Path(source).exists():
+        return None
+    df = pd.read_csv(source)
+    try:
+        dataset = DATASETS.get(model_info.get("dataset_id"))
+        _, comp = load_compound_library(dataset["compound_id"])
+        smiles = comp[["CID", "SMILES"]].drop_duplicates("CID").astype({"CID": str})
+        df["CID"] = df["CID"].astype(str)
+        df = df.merge(smiles, on="CID", how="left")
+    except Exception:
+        pass
+    return df
+
+
 def _show_comparison_result(dft_id, comp):
     render_header()
     delta = comp["delta_cv_r2"]
@@ -1020,32 +1066,77 @@ def _show_comparison_result(dft_id, comp):
     ui.pause()
 
 
-def _benchmark_feature_selection(model_id, row, geometry_dir):
-    """Benchmark the selection methods (before/after DFT) and open the comparison plot."""
-    render_header()
-    sets = _dft_sets_for_geometry(geometry_dir)
-    dft_df = None
-    if sets:
-        _, dft_df = load_dft_descriptor_set(sets[-1][0])
-    else:
-        ui.note("No DFT/redox descriptor set found — benchmarking without the DFT block.")
+def _compare_dft_value(model_id, row, geometry_dir, dft_id):
+    """Baseline vs DFT-augmented CV for the selected parsed result set.
 
-    model_info = MODELS.get(model_id)
-    params = model_info["parameters"]
-    source = params.get("source_dataset")
-    if not source or not Path(source).exists():
+    Answers "is this DFT block worth the compute?" — Δ CV R² (random vs grouped),
+    the DFT importance share, and per-feature importances — using the same
+    training params (fingerprint + cluster grouping) as everything else, and
+    saving the result to this set's comparison history.
+    """
+    from ivette.core.train_xgboost_emfp import build_model
+
+    render_header()
+    df = _load_model_source_df(model_id)
+    if df is None:
         ui.error("Model source dataset not found.")
         ui.pause()
         return
-    df = pd.read_csv(source)
-    try:
-        dataset = DATASETS.get(model_info.get("dataset_id"))
-        _, comp = load_compound_library(dataset["compound_id"])
-        smiles = comp[["CID", "SMILES"]].drop_duplicates("CID").astype({"CID": str})
-        df["CID"] = df["CID"].astype(str)
-        df = df.merge(smiles, on="CID", how="left")
-    except Exception:
-        pass
+    dinfo, dft_df = load_dft_descriptor_set(dft_id)
+
+    grouping = ui.select(
+        "Group the cross-validation by:",
+        [
+            ("Cluster — predict new analogs of this family (recommended)", "cluster"),
+            ("Scaffold — novel-chemotype stress test", "scaffold"),
+        ],
+    )
+    if grouping is ui.CANCEL:
+        grouping = "cluster"
+
+    tp = configure_stage("training")
+    if grouping == "cluster":
+        _preview_cluster_groups(df, row["target"], tp)
+
+    ui.info(f"Comparing baseline vs '{dinfo['name']}' DFT features ({grouping} CV)…")
+    with ui.status("Training baseline and DFT-augmented models…"):
+        res = compare_target_with_dft(
+            df, row["target"], dft_df, grouping=grouping,
+            radius=tp.radius, nbits=tp.nbits,
+            cluster_cutoff=tp.cluster_cutoff,
+            cluster_fp_radius=tp.cluster_fp_radius,
+            cluster_fp_bits=tp.cluster_fp_bits,
+            model_factory=lambda: build_model(tp),
+        )
+    if "error" in res:
+        ui.warn(f"Cannot compare: {res['error']}")
+        ui.pause()
+        return
+
+    add_dft_comparison(dft_id, res)        # persist to this set's history
+    _show_comparison_result(dft_id, res)   # renders the tables + ui.pause()
+
+
+def _benchmark_feature_selection(model_id, row, geometry_dir, dft_id=None):
+    """Benchmark the selection methods (before/after DFT) and open the comparison plot."""
+    render_header()
+    dft_df = None
+    if dft_id:
+        dinfo, dft_df = load_dft_descriptor_set(dft_id)
+        ui.info(f"Using parsed result set '{dinfo['name']}' as the DFT block.")
+    else:
+        sets = _dft_sets_for_geometry(geometry_dir)
+        if sets:
+            _, dft_df = load_dft_descriptor_set(sets[-1][0])
+        else:
+            ui.note("No DFT/redox descriptor set found — benchmarking without the DFT block.")
+
+    model_info = MODELS.get(model_id)
+    df = _load_model_source_df(model_id)
+    if df is None:
+        ui.error("Model source dataset not found.")
+        ui.pause()
+        return
 
     grouping = ui.select(
         "Group the cross-validation by:",
@@ -1111,57 +1202,89 @@ def _benchmark_feature_selection(model_id, row, geometry_dir):
     ui.pause()
 
 
-def _optimize_training_params(model_id, row, geometry_dir):
+def _preview_cluster_groups(df, target, tp, smiles_col="SMILES"):
+    """Show how many cluster-CV groups the current settings yield vs a finer FP.
+
+    Lets the user see, before committing to a run, whether the cutoff/resolution
+    actually separates their (often near-identical) analogs — and that raising
+    cluster_fp_bits/radius is the lever when a low cutoff still gives few groups.
+    """
+    from ivette.core.modeling import cluster_groups
+    if smiles_col not in df.columns:
+        return
+    smis = df.dropna(subset=[target])[smiles_col].dropna().tolist()
+    n = len(smis)
+    if n < 2 or n > 3000:        # Butina is O(n²); skip the preview on huge sets
+        return
+    cur = (tp.cluster_fp_radius, tp.cluster_fp_bits)
+    combos = [cur] + [c for c in [(3, 4096)] if c != cur]
+    rows = []
+    for r, b in combos:
+        ng = len(set(cluster_groups(smis, cutoff=tp.cluster_cutoff, radius=r, fp_bits=b)))
+        tag = "  (current)" if (r, b) == cur else ""
+        rows.append((f"radius {r}, {b} bits{tag}", f"{ng} / {n}"))
+    ui.table([("Cluster FP", "muted"), ("Groups / compounds", "white")], rows,
+             title=f"Cluster groups at cutoff {tp.cluster_cutoff} "
+                   f"(Tanimoto ≥ {1 - tp.cluster_cutoff:.2f} shares a fold)")
+    ui.note("Few groups means analogs collide to one fingerprint, so no cutoff can split "
+            "them. Raise cluster_fp_bits/radius (training → Advanced options) for finer, "
+            "honest groups; lower cluster_cutoff makes folds less aggressive.")
+
+
+def _optimize_training_params(model_id, row, geometry_dir, dft_id=None):
     """Bayesian (Optuna) search over the XGBoost hyperparameters for this target."""
     render_header()
-    model_info = MODELS.get(model_id)
-    params = model_info["parameters"]
-    source = params.get("source_dataset")
-    if not source or not Path(source).exists():
+    df = _load_model_source_df(model_id)
+    if df is None:
         ui.error("Model source dataset not found.")
         ui.pause()
         return
-    df = pd.read_csv(source)
-    try:
-        dataset = DATASETS.get(model_info.get("dataset_id"))
-        _, comp = load_compound_library(dataset["compound_id"])
-        smiles = comp[["CID", "SMILES"]].drop_duplicates("CID").astype({"CID": str})
-        df["CID"] = df["CID"].astype(str)
-        df = df.merge(smiles, on="CID", how="left")
-    except Exception:
-        pass
 
-    # Optionally fold in the same DFT/redox features + selection you'll train on,
-    # so the search optimizes the real feature matrix.
-    sets = _dft_sets_for_geometry(geometry_dir)
+    # Fold in the selected parsed result set as DFT/redox features, so the search
+    # optimizes the real feature matrix you'll train on.
     dft_df = None
-    if sets and ui.confirm("Include the latest DFT/redox descriptor set as features?",
-                           default=True):
-        _, dft_df = load_dft_descriptor_set(sets[-1][0])
+    if dft_id:
+        dinfo, dft_df = load_dft_descriptor_set(dft_id)
+        ui.info(f"Using parsed result set '{dinfo['name']}' as DFT features.")
+    else:
+        sets = _dft_sets_for_geometry(geometry_dir)
+        if sets and ui.confirm("Include the latest DFT/redox descriptor set as features?",
+                               default=True):
+            _, dft_df = load_dft_descriptor_set(sets[-1][0])
 
     grouping = ui.select(
         "Optimize the CV score grouped by:",
         [
             ("Cluster — predict new analogs of this family (recommended)", "cluster"),
             ("Scaffold — novel-chemotype stress test", "scaffold"),
+            ("Random — shuffled K-fold (optimistic; analogs may leak across folds)", "random"),
         ],
     )
     if grouping is ui.CANCEL:
         grouping = "cluster"
 
     base_tp = configure_stage("training")
+    if grouping == "cluster":
+        _preview_cluster_groups(df, row["target"], base_tp)
     fsp = None
     if ui.confirm("Apply a feature-selection config during the search?",
                   default=dft_df is not None):
         fsp = configure_stage("feature_selection")
     n_trials = ui.ask_int("Number of search trials (more = better, slower)", 50)
+    outer_folds = ui.ask_int(
+        "Nested-CV outer folds for the honest estimate (0 = skip, fastest)", 5)
+    if outer_folds and outer_folds > 0:
+        ui.note(f"Nested CV runs ≈{outer_folds + 1} studies of {n_trials} trials each "
+                f"(~{(outer_folds + 1) * n_trials} quick trainings). Lower the trials "
+                "or folds if this is too slow.")
 
     ui.info(f"Optimizing XGBoost hyperparameters for '{row['target']}' "
             f"({grouping} CV, {n_trials} trials)…")
     with ui.status("Bayesian search (Optuna TPE) — running many quick trainings…"):
         res = optimize_training_params(df, row["target"], dft_df,
                                        base_tp=base_tp, fsp=fsp,
-                                       n_trials=n_trials, grouping=grouping)
+                                       n_trials=n_trials, grouping=grouping,
+                                       outer_folds=outer_folds)
     if "error" in res:
         ui.warn(f"Cannot optimize: {res['error']}")
         ui.pause()
@@ -1175,6 +1298,42 @@ def _optimize_training_params(model_id, row, geometry_dir):
               f"(best {grouping} CV R² = {res['best_score']:+.4f}, "
               f"n={res['n_samples']}, trials={res['n_trials']})",
     )
+
+    # Honest score: nested CV — each outer fold is tuned independently and scored
+    # on its held-out part, so it estimates the whole tune-then-train procedure
+    # rather than the cherry-picked search score.
+    if res.get("nested_cv_r2") is not None:
+        metrics = [
+            ("Outer folds", res["outer_folds"]),
+            (f"Groups (n={res['n_samples']})", res["n_groups"]),
+            ("Search CV R² (optimistic)", f"{res['best_score']:+.4f}"),
+            ("Nested CV R² (honest)",
+             f"{res['nested_cv_r2']:+.4f} ± {res['nested_cv_std']:.3f}"),
+        ]
+        if grouping == "cluster":
+            metrics.insert(2, ("Cluster cutoff", base_tp.cluster_cutoff))
+        ui.table(
+            [("Metric", "muted"), ("Value", "white")], metrics,
+            title=f"Nested CV honest estimate ({grouping}-grouped)",
+        )
+        if grouping in ("cluster", "scaffold") and res["n_groups"] <= res["outer_folds"]:
+            ui.warn(f"Only {res['n_groups']} groups — folds hold out near-whole families, "
+                    "so the honest score is a harsh extrapolation test. With related "
+                    "compounds, lower the cluster cutoff (training → Advanced options).")
+        ui.table(
+            [("Outer fold", "muted"), ("Test R²", "accent"), ("Inner best CV", "muted"),
+             ("n test", "muted")],
+            [(f["fold"], f"{f['test_r2']:+.4f}", f"{f['inner_best_cv']:+.4f}", f["n_test"])
+             for f in res["fold_scores"]],
+            title="Per outer-fold scores",
+        )
+        if res["nested_cv_r2"] < res["best_score"] - 0.1:
+            ui.warn("Nested CV R² is well below the search CV score — the search is "
+                    "partly fitting CV noise; trust the nested figure.")
+    else:
+        ui.note("Too few groups for a grouped nested split — reported the search CV "
+                "only, which is optimistically biased.")
+
     if res["n_samples"] < base_tp.min_reliable_samples:
         ui.warn(f"n={res['n_samples']} is small — the 'best' config can be tuned to "
                 "CV noise. Treat the improvement cautiously.")
@@ -1187,11 +1346,15 @@ def _optimize_training_params(model_id, row, geometry_dir):
     ui.pause()
 
 
-def _dft_comparisons_menu(model_id, row, geometry_dir):
+def _dft_comparisons_menu(model_id, row, geometry_dir, dft_id=None):
     while True:
         render_header()
-        sets = _dft_sets_for_geometry(geometry_dir)
-        comparisons = [(d, c) for d, info in sets for c in info.get("comparisons", [])]
+        if dft_id:
+            info = DFT_DESCRIPTORS.get(dft_id) or {}
+            comparisons = [(dft_id, c) for c in info.get("comparisons", [])]
+        else:
+            sets = _dft_sets_for_geometry(geometry_dir)
+            comparisons = [(d, c) for d, info in sets for c in info.get("comparisons", [])]
         if not comparisons:
             ui.note("No saved comparisons — run 'Benchmark feature selection + DFT' first.")
             ui.pause()
@@ -1293,13 +1456,12 @@ def generate_geometry_set(model_id, row):
     ui.pause()
 
 
-def _create_dft_descriptor_set(model_id, row, geometry_dir):
-    """Parse this geometry set's Gaussian freq logs into a new DFT descriptor set."""
+def _create_dft_descriptor_set(model_id, row, calc_info, calc_id):
+    """Parse a calculation set's Gaussian freq logs into a new DFT descriptor set."""
     render_header()
-    rows = parse_geometry_descriptors(geometry_dir / "gaussian")
+    rows = parse_geometry_descriptors(Path(calc_info["output_dir"]))
     if not rows:
-        ui.warn("No completed frequency calculations found here — "
-                "run 'Gaussian opt then freq' first.")
+        ui.warn("No completed frequency calculations found in this calculation set.")
         ui.pause()
         return
     ui.info(f"Parsed {len(rows)} compounds from frequency logs.")
@@ -1308,14 +1470,11 @@ def _create_dft_descriptor_set(model_id, row, geometry_dir):
         ui.warn("Cancelled.")
         ui.pause()
         return
-    geometry_id = next(
-        (k for k, v in GEOMETRIES.items() if Path(v["output_dir"]) == geometry_dir),
-        None,
-    )
     with ui.status("Saving descriptor set…"):
         dft_id, df = save_dft_descriptor_set(
-            rows, name, model_id, row["target"], geometry_id,
-            parameters={"source_gaussian": str(geometry_dir / "gaussian")},
+            rows, name, model_id, row["target"], calc_info["geometry_id"],
+            parameters={"source_gaussian": calc_info["output_dir"]},
+            calc_id=calc_id,
         )
     n_props = len([c for c in df.columns if c != "CID"])
     ui.success(f"Created DFT descriptor set '{name}'  ({dft_id}) — "
@@ -1323,19 +1482,14 @@ def _create_dft_descriptor_set(model_id, row, geometry_dir):
     ui.pause()
 
 
-def _create_redox_descriptor_set(model_id, row, geometry_dir):
-    """Parse the COSMO neutral+anion runs into a redox descriptor set.
+def _create_redox_descriptor_set(model_id, row, calc_info, calc_id):
+    """Parse a COSMO calculation set's neutral+anion runs into a redox descriptor set.
 
     Produces neutral_*, anion_*, and delta_* (ΔG/ΔH/ΔS of reduction, etc.)
     features for every compound completed in both charge states.
     """
     render_header()
-    cosmo_root = geometry_dir / "gaussian" / "opt_then_freq_COSMO"
-    if not cosmo_root.exists():
-        ui.warn("No COSMO results here — run "
-                "'Run opt+freq with COSMO (neutral + anion)' first.")
-        ui.pause()
-        return
+    cosmo_root = Path(calc_info["output_dir"])
     rows = parse_redox_descriptors(cosmo_root)
     if not rows:
         ui.warn("No compounds completed in BOTH neutral and anion states yet "
@@ -1348,18 +1502,110 @@ def _create_redox_descriptor_set(model_id, row, geometry_dir):
         ui.warn("Cancelled.")
         ui.pause()
         return
-    geometry_id = next(
-        (k for k, v in GEOMETRIES.items() if Path(v["output_dir"]) == geometry_dir),
-        None,
-    )
     with ui.status("Saving descriptor set…"):
         dft_id, df = save_dft_descriptor_set(
-            rows, name, model_id, row["target"], geometry_id,
+            rows, name, model_id, row["target"], calc_info["geometry_id"],
             parameters={"source_cosmo": str(cosmo_root), "kind": "redox"},
+            calc_id=calc_id,
         )
     n_props = len([c for c in df.columns if c != "CID"])
     ui.success(f"Created redox descriptor set '{name}'  ({dft_id}) — "
                f"{len(df)} compounds × {n_props} features")
+    ui.pause()
+
+
+def _run_marcus_reorganization(model_id, row, geometry_dir):
+    """Marcus reorganization energy λ + activation free energy ΔG‡.
+
+    Reuses the optimized neutral/anion geometries from the COSMO opt+freq run;
+    only the two Marcus cross single points per compound are computed (and they
+    resume), so the opt/freq jobs are never repeated. Saves λ / ΔG‡ as a DFT
+    descriptor set so they can feed the model like any other feature.
+    """
+    from ivette.core.marcus import available_pairs, compute_marcus, MARCUS_FEATURE_COLUMNS
+
+    render_header()
+    cosmo_root = geometry_dir / "gaussian" / "opt_then_freq_COSMO"
+    if not cosmo_root.exists():
+        ui.warn("No COSMO results here — run "
+                "'Run opt+freq with COSMO (neutral + anion)' first.")
+        ui.pause()
+        return
+
+    cids = available_pairs(cosmo_root)
+    if not cids:
+        ui.warn("No compounds completed in BOTH neutral and anion states yet "
+                "(Marcus needs both optimized geometries).")
+        ui.pause()
+        return
+
+    ui.info(f"{len(cids)} compound(s) have both optimized geometries. Marcus reuses "
+            "them and adds two single points each (the cross terms E_R^OG, E_O^RG); "
+            "the opt+freq jobs are NOT repeated.")
+
+    # The single points must match the COSMO run's level of theory for the four
+    # energies to be comparable — defaults come from the gaussian-stage preset.
+    gp = configure_stage("gaussian")
+    plan = hardware.recommend_gaussian_resources(len(cids))
+    ui.note("Single points are cheap; sizing per-job cores/memory:")
+    nproc = ui.ask_int("Cores per single point (%nprocshared)", plan.nproc)
+    mem = ui.ask_text("Memory per single point (%mem)", plan.mem)
+
+    settings = dict(method=gp.method, basis_set=gp.basis_set, nproc=nproc, mem=mem,
+                    extra_keywords=gp.extra_keywords, timeout=(gp.timeout or None),
+                    g16_exec="g16")
+
+    _ensure_control_room()
+    ui.rule("Marcus reorganization energy (reusing COSMO geometries)")
+    with ui.progress() as prog:
+        task = prog.add_task("Cross single points…", total=len(cids))
+
+        def _progress(cid):
+            prog.update(task, description=str(cid)[:38])
+            prog.advance(task)
+
+        rows, _skipped = compute_marcus(cosmo_root, settings=settings, progress=_progress)
+
+    ok = [r for r in rows if r.get("reorg_energy_eV") is not None]
+    failed = [r for r in rows if r.get("reorg_energy_eV") is None]
+
+    if ok:
+        render_header()
+        ui.table(
+            [("CID", "white"), ("λ (eV)", "accent"), ("ΔG° (eV)", "muted"),
+             ("ΔG‡ (eV)", "accent")],
+            [(r["CID"], f"{r['reorg_energy_eV']:.3f}",
+              "n/a" if r["dG_reduction_eV"] is None else f"{r['dG_reduction_eV']:+.3f}",
+              "n/a" if r["activation_energy_eV"] is None else f"{r['activation_energy_eV']:.3f}")
+             for r in ok[:30]],
+            title=f"Marcus λ / ΔG‡ — {row['target']}  ({len(ok)} compounds)",
+        )
+    if failed:
+        ui.warn(f"{len(failed)} compound(s) failed their single points "
+                f"(e.g. {failed[0]['CID']}: {(failed[0].get('error') or '')[:60]}).")
+    if not ok:
+        ui.pause()
+        return
+
+    if ui.confirm("Save λ / ΔG‡ as a DFT descriptor set (usable as ML features)?",
+                  default=True):
+        name = ui.ask_text("Descriptor set name", f"{row['target']} Marcus")
+        if name:
+            geometry_id = _geometry_id_for(geometry_dir)
+            # Link the Marcus result to the COSMO calculation set it was built from.
+            calc_id = find_calculation_set(geometry_id, cosmo_root)
+            feats = [{"CID": r["CID"], **{c: r[c] for c in MARCUS_FEATURE_COLUMNS}}
+                     for r in ok]
+            with ui.status("Saving descriptor set…"):
+                dft_id, df = save_dft_descriptor_set(
+                    feats, name, model_id, row["target"], geometry_id,
+                    parameters={"kind": "marcus", "source_cosmo": str(cosmo_root),
+                                "method": gp.method, "basis": gp.basis_set},
+                    calc_id=calc_id,
+                )
+            n_props = len([c for c in df.columns if c != "CID"])
+            ui.success(f"Created Marcus descriptor set '{name}'  ({dft_id}) — "
+                       f"{len(df)} compounds × {n_props} features")
     ui.pause()
 
 
@@ -1386,6 +1632,140 @@ def show_dft_descriptor_set(dft_id):
     return info
 
 
+def _completed_calc_count(info):
+    """Compounds with a normally-terminated calculation in a calc set (for display)."""
+    out = Path(info["output_dir"])
+    if not out.exists():
+        return 0
+    if info.get("cosmo"):
+        from ivette.core.marcus import available_pairs
+        return len(available_pairs(out))
+    return sum(
+        1 for d in out.iterdir()
+        if d.is_dir() and any(g16.check_normal_termination(str(p)) for p in d.glob("*.log"))
+    )
+
+
+def _modeling_menu(model_id, row, geometry_dir, dft_id):
+    """Modeling tools (FS benchmark, Bayesian sweep, history) scoped to one
+    selected parsed result set — the bottom of the geometry → calculation →
+    parsed-result → modeling drill-down."""
+    dinfo = DFT_DESCRIPTORS.get(dft_id) or {}
+    while True:
+        render_header()
+        ui.table(
+            [("Field", "muted"), ("Value", "white")],
+            [("Target", row["target"]),
+             ("Parsed result set", dinfo.get("name", dft_id)),
+             ("Features", len(dinfo.get("property_columns", [])))],
+            title="Modeling",
+        )
+        action = ui.select(
+            "Modeling",
+            [
+                ui.section("DFT value"),
+                ("Does this DFT set help? (baseline vs augmented CV)", "compare"),
+                ui.section("Feature selection"),
+                ("Benchmark feature selection + DFT (random vs cluster/scaffold)", "fsbench"),
+                ui.section("Hyperparameters"),
+                ("Optimize training parameters (Bayesian sweep)", "hpo"),
+                ui.section("History"),
+                ("DFT comparison results", "dftresults"),
+                ui.section(""),
+                ("← Back", "back"),
+            ],
+        )
+        if action is ui.CANCEL or action == "back":
+            return
+        if action == "compare":
+            _compare_dft_value(model_id, row, geometry_dir, dft_id)
+        elif action == "fsbench":
+            _benchmark_feature_selection(model_id, row, geometry_dir, dft_id)
+        elif action == "hpo":
+            _optimize_training_params(model_id, row, geometry_dir, dft_id)
+        elif action == "dftresults":
+            _dft_comparisons_menu(model_id, row, geometry_dir, dft_id)
+
+
+def _parsed_result_sets_menu(model_id, row, geometry_dir, calc_id):
+    """List parsed result sets derived from a calc set; open one → Modeling."""
+    while True:
+        render_header()
+        sets = dft_descriptor_sets_for_calc(calc_id)
+        if not sets:
+            ui.note("No parsed result sets yet — run a parsing action in DFT analysis first.")
+            ui.pause()
+            return
+        choices = [ui.section("Parsed result sets")]
+        for dft_id, info in sets:
+            choices.append((
+                f"{info['name']}  ({info['compound_count']} cmpd × "
+                f"{len(info.get('property_columns', []))} props)", dft_id))
+        choices += [ui.section(""), ("← Back", "back")]
+        choice = ui.select("Parsed result sets", choices)
+        if choice is ui.CANCEL or choice == "back":
+            return
+        _modeling_menu(model_id, row, geometry_dir, choice)
+
+
+def calculation_set_menu(model_id, row, geometry_dir, calc_id):
+    """DFT analysis for one calculation set: parse → parsed result sets → modeling."""
+    while True:
+        info = CALCULATIONS.get(calc_id)
+        if info is None:
+            return
+        render_header()
+        ui.table(
+            [("Field", "muted"), ("Value", "white")],
+            [("Calculation set", info["name"]),
+             ("Operation", info["operation"] + (" + COSMO" if info.get("cosmo") else "")),
+             ("Completed", _completed_calc_count(info))],
+            title="Calculation set — DFT analysis",
+        )
+        choices = [ui.section("Parse → parsed result set")]
+        if info.get("cosmo"):
+            choices.append(("Parse redox descriptors (neutral / anion / Δ)", "redox"))
+        else:
+            choices.append(("Parse DFT descriptors (freq results)", "dft"))
+        choices += [
+            ui.section("Modeling"),
+            ("Parsed result sets  →  modeling", "parsed"),
+            ui.section(""),
+            ("← Back", "back"),
+        ]
+        choice = ui.select("DFT analysis", choices)
+        if choice is ui.CANCEL or choice == "back":
+            return
+        if choice == "dft":
+            _create_dft_descriptor_set(model_id, row, info, calc_id)
+        elif choice == "redox":
+            _create_redox_descriptor_set(model_id, row, info, calc_id)
+        elif choice == "parsed":
+            _parsed_result_sets_menu(model_id, row, geometry_dir, calc_id)
+
+
+def _calculation_sets_menu(model_id, row, geometry_dir):
+    """List the calculation sets for this geometry set; open one → DFT analysis."""
+    while True:
+        render_header()
+        geometry_id = _geometry_id_for(geometry_dir)
+        sets = calculation_sets_for_geometry(geometry_id)
+        if not sets:
+            ui.note("No calculation sets yet — run a Gaussian calculation first.")
+            ui.pause()
+            return
+        choices = [ui.section("Calculation sets")]
+        for calc_id, info in sets:
+            stamp = info.get("updated", info.get("created", "")).replace("T", " ")
+            choices.append((
+                f"{info['name']}  ({_completed_calc_count(info)} done)  ·  {stamp}", calc_id))
+        choices += [ui.section(""), ("← Back", "back")]
+        choice = ui.select("Calculation sets", choices)
+        if choice is ui.CANCEL or choice == "back":
+            return
+        calculation_set_menu(model_id, row, geometry_dir, choice)
+
+
 def geometry_set_menu(model_id, row, geometry_dir):
     while True:
         render_header()
@@ -1400,13 +1780,11 @@ def geometry_set_menu(model_id, row, geometry_dir):
                 ui.section("Gaussian calculations"),
                 ("Run Gaussian opt then freq", "opt"),
                 ("Run opt+freq with COSMO (neutral + anion)", "opt_cosmo"),
+                ("Run opt+freq COSMO + Marcus ΔG‡ (neutral + anion, reuses geometries)",
+                 "opt_cosmo_marcus"),
                 ("Run Gaussian single point", "sp"),
-                ui.section("DFT analysis"),
-                ("Parse DFT descriptors (freq results)", "dft"),
-                ("Parse COSMO redox descriptors (neutral / anion / Δ)", "redox"),
-                ("Benchmark feature selection + DFT (random vs cluster/scaffold)", "fsbench"),
-                ("Optimize training parameters (Bayesian sweep)", "hpo"),
-                ("DFT comparison results (history)", "dftresults"),
+                ui.section("Analysis"),
+                ("Calculation sets  →  DFT analysis  →  modeling", "calcsets"),
                 ui.section("Manage"),
                 ("Delete Geometry set", "delete"),
                 ("← Back", "back"),
@@ -1421,18 +1799,18 @@ def geometry_set_menu(model_id, row, geometry_dir):
                 model_id, geometry_dir, operation="opt then freq", cosmo=True,
                 charge_states=[("neutral", 0, 1), ("anion", -1, 2)],
             )
+        elif action == "opt_cosmo_marcus":
+            # Run/resume the COSMO opt+freq first (completed compounds are skipped,
+            # so prior optimized geometries are reused), then compute Marcus λ/ΔG‡.
+            run_gaussian_pipeline(
+                model_id, geometry_dir, operation="opt then freq", cosmo=True,
+                charge_states=[("neutral", 0, 1), ("anion", -1, 2)],
+            )
+            _run_marcus_reorganization(model_id, row, geometry_dir)
         elif action == "sp":
             run_gaussian_pipeline(model_id, geometry_dir, operation="sp")
-        elif action == "dft":
-            _create_dft_descriptor_set(model_id, row, geometry_dir)
-        elif action == "redox":
-            _create_redox_descriptor_set(model_id, row, geometry_dir)
-        elif action == "fsbench":
-            _benchmark_feature_selection(model_id, row, geometry_dir)
-        elif action == "hpo":
-            _optimize_training_params(model_id, row, geometry_dir)
-        elif action == "dftresults":
-            _dft_comparisons_menu(model_id, row, geometry_dir)
+        elif action == "calcsets":
+            _calculation_sets_menu(model_id, row, geometry_dir)
         elif action == "delete":
             geometry_id = next(
                 (k for k, v in GEOMETRIES.items() if Path(v["output_dir"]) == geometry_dir),

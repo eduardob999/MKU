@@ -65,9 +65,9 @@ class DatasetParams:
 @dataclass
 class GaussianParams:
     method: str = field(
-        default="B3LYP", metadata={"help": "DFT functional (e.g. B3LYP, PBE0, M062X)"})
+        default="PBE0", metadata={"help": "DFT functional (e.g. B3LYP, PBE0, M062X)"})
     basis_set: str = field(
-        default="6-31G*", metadata={"help": "Basis set (e.g. 6-31G*, 6-311+G(d,p))"})
+        default="6-311G", metadata={"help": "Basis set (e.g. 6-311G, 6-311G(d,p), 6-311+G(d,p))"})
     preopt_mode: str = field(
         default="auto", metadata={"help": "Pre-optimisation before DFT",
                                   "choices": ["auto", "none", "pm7", "gaussian631g"]})
@@ -113,6 +113,20 @@ class TrainingParams:
         default="both",
         metadata={"help": "Which CV score(s) to report (cluster = within-family middle ground)",
                   "choices": ["both", "scaffold", "random", "cluster"]})
+    cluster_cutoff: float = field(
+        default=0.4,
+        metadata={"help": "Butina cluster CV cutoff: group compounds with Tanimoto ≥ 1-cutoff. "
+                          "Lower = only near-duplicates grouped (least aggressive, closer to "
+                          "random); higher = whole families held out (most aggressive)"})
+    cluster_fp_radius: int = field(
+        default=2,
+        metadata={"help": "Morgan radius for the cluster-CV similarity fingerprint. Raise to "
+                          "tell tight analogs apart (more, finer cluster groups)"})
+    cluster_fp_bits: int = field(
+        default=1024,
+        metadata={"help": "Bit length of the cluster-CV similarity fingerprint. Raise (e.g. "
+                          "2048/4096) when analogs collide to the same FP and no cutoff can "
+                          "split them"})
     min_reliable_samples: int = field(
         default=50,
         metadata={"help": "Below this sample count a target's CV score is flagged unreliable"})

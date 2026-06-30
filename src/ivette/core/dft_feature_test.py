@@ -29,7 +29,8 @@ from ivette.core.modeling import (
 
 def compare_target_with_dft(source, target, dft_df, *,
                             smiles_col="SMILES", radius=2, nbits=512, fsp=None,
-                            grouping="cluster", model_factory=None):
+                            grouping="cluster", cluster_cutoff=0.4,
+                            cluster_fp_radius=2, cluster_fp_bits=1024, model_factory=None):
     """Return a dict comparing baseline vs DFT-augmented CV R² for ``target``.
 
     ``source`` is the model's training data (a DataFrame, or a CSV path) which
@@ -79,8 +80,9 @@ def compare_target_with_dft(source, target, dft_df, *,
     # new analogs of this family"; scaffold = novel-chemotype stress test. The
     # random-vs-grouped gap is the leakage / over-fit meter.
     mf = model_factory or build_model
-    groups = (cluster_groups(sub[smiles_col]) if grouping == "cluster"
-              else scaffold_groups(sub[smiles_col]))
+    groups = (cluster_groups(sub[smiles_col], cutoff=cluster_cutoff,
+                             radius=cluster_fp_radius, fp_bits=cluster_fp_bits)
+              if grouping == "cluster" else scaffold_groups(sub[smiles_col]))
     base = evaluate_cv(mf, base, y, groups, strategy="both")
     aug = evaluate_cv(mf, augmented, y, groups, strategy="both")
 

@@ -64,8 +64,9 @@ def _build_matrices(source, target, dft_df, smiles_col, tp, grouping="cluster"):
     fp = generate_emfp_dataframe(sub[smiles_col], radius=tp.radius, nbits=tp.nbits)
     base = pd.concat(
         [sub[descriptor_features].reset_index(drop=True), fp.reset_index(drop=True)], axis=1)
-    groups = (cluster_groups(sub[smiles_col]) if grouping == "cluster"
-              else scaffold_groups(sub[smiles_col]))
+    groups = (cluster_groups(sub[smiles_col], cutoff=tp.cluster_cutoff,
+                             radius=tp.cluster_fp_radius, fp_bits=tp.cluster_fp_bits)
+              if grouping == "cluster" else scaffold_groups(sub[smiles_col]))
 
     augmented = None
     if dft_df is not None:

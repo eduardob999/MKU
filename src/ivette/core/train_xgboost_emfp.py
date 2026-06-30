@@ -234,7 +234,10 @@ def train_target(
     # Grouping for leakage-safe CV: scaffold (default) or cluster (within-family
     # middle ground). 'cluster' still reports random alongside the grouped score.
     if tp.cv_strategy == "cluster":
-        groups, cv_grouping, eval_strategy = cluster_groups(subset[smiles_col]), "cluster", "both"
+        groups, cv_grouping, eval_strategy = (
+            cluster_groups(subset[smiles_col], cutoff=tp.cluster_cutoff,
+                           radius=tp.cluster_fp_radius, fp_bits=tp.cluster_fp_bits),
+            "cluster", "both")
     else:
         groups, cv_grouping, eval_strategy = scaffold_groups(subset[smiles_col]), "scaffold", tp.cv_strategy
 

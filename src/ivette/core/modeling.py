@@ -214,19 +214,25 @@ def evaluate_cv(model_factory, X, y, groups=None, *, strategy="both",
     return out
 
 
-def cluster_groups(smiles_iter, cutoff=0.4):
+def cluster_groups(smiles_iter, cutoff=0.4, *, radius=2, fp_bits=1024):
     """Butina cluster label per molecule (Tanimoto on Morgan FPs).
 
     A middle-ground grouping between random and scaffold: compounds with
     Tanimoto similarity above ``1 - cutoff`` share a cluster. Matches "predict
     new analogs of the family I already have" better than holding out whole
     scaffolds. Invalid SMILES get a unique label.
+
+    ``radius`` / ``fp_bits`` set the resolution of the similarity fingerprint.
+    With a tight analog series, close analogs can hash to the *same* low-bit
+    fingerprint (Tanimoto distance 0), so no ``cutoff`` can split them — raising
+    ``fp_bits`` (and/or ``radius``) lets the grouper tell them apart and yields
+    more, finer clusters.
     """
     from rdkit import Chem, DataStructs
     from rdkit.Chem import rdFingerprintGenerator
     from rdkit.ML.Cluster import Butina
 
-    gen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=1024)
+    gen = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=fp_bits)
     fps = []
     for smi in smiles_iter:
         m = Chem.MolFromSmiles(str(smi))

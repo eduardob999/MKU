@@ -28,6 +28,7 @@ from ivette.util.paths import (
     MODEL_METADATA_FILE,
     GEOMETRY_RUN_DIR,
     GEOMETRY_METADATA_FILE,
+    CALCULATION_METADATA_FILE,
     DFT_DESCRIPTOR_DIR,
     DFT_DESCRIPTOR_METADATA_FILE,
     LOG_DIR,
@@ -41,6 +42,7 @@ COMPOUNDS = MetadataStore(COMPOUND_METADATA_FILE, "compounds", "compound")
 DATASETS = MetadataStore(DATASET_METADATA_FILE, "datasets", "dataset")
 MODELS = MetadataStore(MODEL_METADATA_FILE, "models", "model")
 GEOMETRIES = MetadataStore(GEOMETRY_METADATA_FILE, "geometries", "geometry")
+CALCULATIONS = MetadataStore(CALCULATION_METADATA_FILE, "calculations", "calc")
 DFT_DESCRIPTORS = MetadataStore(DFT_DESCRIPTOR_METADATA_FILE, "dft_descriptors", "dft")
 
 
@@ -50,7 +52,8 @@ def _now():
 
 def ensure_storage():
     """Create every data directory and an empty metadata file where missing."""
-    for store in (STRUCTURES, COMPOUNDS, DATASETS, MODELS, GEOMETRIES, DFT_DESCRIPTORS):
+    for store in (STRUCTURES, COMPOUNDS, DATASETS, MODELS, GEOMETRIES,
+                  CALCULATIONS, DFT_DESCRIPTORS):
         store.ensure()
     for run_dir in (DATASET_RUN_DIR, GEOMETRY_RUN_DIR, MODEL_RUN_DIR,
                     LOG_DIR, EXPORT_DIR, PRESET_DIR):
@@ -171,6 +174,56 @@ def count_geometries(folder):
 
 
 # ---------------------------------------------------------------------------
+# Calculation sets (a registered Gaussian run on a geometry set)
+# ---------------------------------------------------------------------------
+
+def find_calculation_set(geometry_id, output_dir):
+    """The calc-set id for this geometry+output dir, or None (one per operation)."""
+    return next(
+        (cid for cid, info in CALCULATIONS.items()
+         if info.get("geometry_id") == geometry_id
+         and info.get("output_dir") == str(output_dir)),
+        None,
+    )
+
+
+def register_or_update_calculation_set(*, model_id, target, geometry_id, name, kind,
+                                       operation, cosmo, charge_states, output_dir,
+                                       parameters=None):
+    """Upsert a Calculation set keyed by (geometry, output dir).
+
+    One set per operation type: re-running the same Gaussian operation updates the
+    existing record (its outputs resume in place) rather than creating a duplicate.
+    Returns the calc-set id.
+    """
+    record = {
+        "name": name,
+        "model_id": model_id,
+        "target": target,
+        "geometry_id": geometry_id,
+        "kind": kind,
+        "operation": operation,
+        "cosmo": bool(cosmo),
+        "charge_states": charge_states,
+        "output_dir": str(output_dir),
+        "parameters": parameters or {},
+    }
+    existing = find_calculation_set(geometry_id, output_dir)
+    if existing:
+        CALCULATIONS.update(existing, updated=_now(), **record)
+        return existing
+    record["created"] = _now()
+    record["updated"] = record["created"]
+    return CALCULATIONS.register(record)
+
+
+def calculation_sets_for_geometry(geometry_id):
+    """List of (calc_id, info) registered under a geometry set."""
+    return [(cid, info) for cid, info in CALCULATIONS.items()
+            if info.get("geometry_id") == geometry_id]
+
+
+# ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
 
@@ -227,7 +280,8 @@ def load_dataset_info(dataset_id):
 # DFT descriptor sets (parsed Gaussian freq properties, per model+target)
 # ---------------------------------------------------------------------------
 
-def save_dft_descriptor_set(rows, name, model_id, target, geometry_id, parameters=None):
+def save_dft_descriptor_set(rows, name, model_id, target, geometry_id,
+                            parameters=None, calc_id=None):
     md = DFT_DESCRIPTORS.load()
     dft_id = DFT_DESCRIPTORS.next_id(md)
     filename = f"{dft_id}.csv"
@@ -241,6 +295,7 @@ def save_dft_descriptor_set(rows, name, model_id, target, geometry_id, parameter
         "model_id": model_id,
         "target": target,
         "geometry_id": geometry_id,
+        "calc_id": calc_id,
         "parameters": parameters or {},
         "compound_count": len(df),
         "property_columns": [c for c in df.columns if c != "CID"],
@@ -262,6 +317,12 @@ def dft_descriptor_sets_for_model(model_id, target=None):
         if info.get("model_id") == model_id
         and (target is None or info.get("target") == target)
     ]
+
+
+def dft_descriptor_sets_for_calc(calc_id):
+    """Parsed result sets derived from a given Calculation set."""
+    return [(dft_id, info) for dft_id, info in DFT_DESCRIPTORS.items()
+            if info.get("calc_id") == calc_id]
 
 
 def add_dft_comparison(dft_id, result):

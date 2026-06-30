@@ -42,6 +42,11 @@ GEOMETRY_METADATA_FILE = GEOMETRY_DIR / "metadata.json"
 GAUSSIAN_BENCHMARK_FILE = GEOMETRY_DIR / "gaussian_benchmark.json"
 GAUSSIAN_BENCHMARK_RUN_DIR = GEOMETRY_DIR / "benchmark_runs"
 
+# Calculation sets (registered Gaussian runs on a geometry set; the outputs
+# themselves live under each geometry set's own gaussian/ directory).
+CALCULATION_DIR = DATA_DIR / "calculations"
+CALCULATION_METADATA_FILE = CALCULATION_DIR / "metadata.json"
+
 # DFT descriptor sets (per-compound properties parsed from Gaussian freq logs)
 DFT_DESCRIPTOR_DIR = DATA_DIR / "dft_descriptors"
 DFT_DESCRIPTOR_METADATA_FILE = DFT_DESCRIPTOR_DIR / "metadata.json"
