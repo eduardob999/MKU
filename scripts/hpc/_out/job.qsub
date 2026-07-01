@@ -1,0 +1,18 @@
+#!/bin/csh
+#PBS -q SMALL
+#PBS -N ivette_selftest
+#PBS -l select=1:ncpus=4:mem=8gb
+#PBS -l walltime=1:00:00
+#PBS -J 1-1
+#PBS -j oe
+
+source /etc/profile.d/modules.csh
+module load g16/c01
+
+set line = `sed -n "${PBS_ARRAY_INDEX}p" "$PBS_O_WORKDIR/manifest.txt"`
+set wd  = `echo "$line" | awk '{print $1}'`
+set inp = `echo "$line" | awk '{print $2}'`
+set out = `echo "$line" | awk '{print $3}'`
+cd "$PBS_O_WORKDIR/$wd"
+setenv GAUSS_SCRDIR "$TMPDIR"
+rung16 "$inp" "$out"

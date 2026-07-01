@@ -40,6 +40,7 @@ def test_build_pbs_array_script_matches_site_template():
     assert "#PBS -J 1-5" in s
     assert "module load g16/c01" in s
     assert "rung16" in s and "GAUSS_SCRDIR" in s
+    assert 'cd "$PBS_O_WORKDIR/$wd"' in s   # workdir relative to submit dir
 
 
 def test_array_finished_detects_live_vs_done():
@@ -82,8 +83,8 @@ def test_submit_batch_stages_polls_and_pulls(tmp_path):
     ft = _FakeTransport([running, done])
 
     res = pbs.submit_batch(
-        ft, local_root=str(local_root), remote_root="~/ivette_runs/geom",
-        manifest_lines=["/remote/d 100.gjf 100_freq.log"],
+        ft, local_root=str(local_root), remote_root="ivette_runs/geom",
+        manifest_lines=["water 100.gjf 100_freq.log"],
         script_text="#!/bin/csh\n", poll_seconds=0, sleep=lambda s: None)
 
     assert res.job_id == "999[].fe3-adm"
@@ -92,3 +93,17 @@ def test_submit_batch_stages_polls_and_pulls(tmp_path):
     kinds = [c[0] for c in ft.calls]
     assert "push" in kinds and "pull" in kinds  # staged up and fetched back
     assert any("qsub" in c[1] for c in ft.calls if c[0] == "run")
+    # results are mirrored back INTO local_root (not its parent) — round-trips in place
+    assert ("pull", "ivette_runs/geom", str(local_root)) in ft.calls
+
+
+def test_submit_batch_strips_leading_tilde(tmp_path):
+    # "~/x" must become home-relative "x" — a quoted "~" won't expand remotely.
+    local = tmp_path / "g"
+    local.mkdir()
+    ft = _FakeTransport(["999 g me 1 F APC\n"])
+    pbs.submit_batch(ft, local_root=str(local), remote_root="~/ivette_runs/geom",
+                     manifest_lines=["w a b"], script_text="x", poll_seconds=0,
+                     sleep=lambda s: None)
+    assert not any("~" in c[-1] for c in ft.calls)              # no tilde anywhere
+    assert ("push", str(local), "ivette_runs/geom") in ft.calls

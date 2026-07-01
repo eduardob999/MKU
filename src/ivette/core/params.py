@@ -12,7 +12,8 @@ can be driven by the terminal today and a web form later.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, fields
+import os
+from dataclasses import asdict, dataclass, field, fields, replace
 from typing import Any, Optional
 
 from ivette.core.download_physchem import DEFAULT_PROPERTIES
@@ -167,8 +168,9 @@ class HpcParams:
     user: str = field(
         default="", metadata={"help": "SSH username on the cluster (required)"})
     remote_root: str = field(
-        default="~/ivette_runs",
-        metadata={"help": "Remote directory under which job inputs/outputs are staged"})
+        default="ivette_runs",
+        metadata={"help": "Remote staging dir, relative to your cluster home "
+                          "(a leading '~/' is stripped — quoted '~' doesn't expand remotely)"})
     gaussian_module: str = field(
         default="g16/c01",
         metadata={"help": "Environment module to load for Gaussian (module load …)"})
@@ -183,7 +185,7 @@ class HpcParams:
         default=30,
         metadata={"help": "How often to poll qstat for job completion"})
     ssh_options: str = field(
-        default="-o BatchMode=yes",
+        default="-o BatchMode=yes -o StrictHostKeyChecking=accept-new",
         metadata={"help": "Extra ssh options (key-based, non-interactive auth assumed)"})
 
 
@@ -223,6 +225,33 @@ def from_dict(cls, data: Optional[dict]):
     valid = {f.name for f in fields(cls)}
     kept = {k: v for k, v in (data or {}).items() if k in valid}
     return cls(**kept)
+
+
+def hpc_from_env(base: "HpcParams | None" = None) -> "HpcParams":
+    """Build ``HpcParams`` from ``IVETTE_HPC_*`` environment variables over defaults.
+
+    Reads USER / HOST / MODULE / REMOTE_ROOT / QUEUE / WALLTIME_HOURS /
+    POLL_SECONDS / SSH_OPTIONS (call :func:`ivette.util.env.load_dotenv` first to
+    pull them from ``.env``). The password is intentionally NOT a field here — it's
+    read separately (``IVETTE_HPC_PASSWORD``) when building the transport, so it
+    never gets persisted into a saved preset.
+    """
+    hp = base or HpcParams()
+    str_map = {
+        "user": "IVETTE_HPC_USER", "host": "IVETTE_HPC_HOST",
+        "gaussian_module": "IVETTE_HPC_MODULE", "remote_root": "IVETTE_HPC_REMOTE_ROOT",
+        "queue": "IVETTE_HPC_QUEUE", "ssh_options": "IVETTE_HPC_SSH_OPTIONS",
+    }
+    over: dict[str, Any] = {f: os.environ[k] for f, k in str_map.items() if os.environ.get(k)}
+    for fld, key in (("walltime_hours", "IVETTE_HPC_WALLTIME_HOURS"),
+                     ("poll_seconds", "IVETTE_HPC_POLL_SECONDS")):
+        val = os.environ.get(key)
+        if val:
+            try:
+                over[fld] = int(val)
+            except ValueError:
+                pass
+    return replace(hp, **over)
 
 
 def _infer_kind(value) -> str:

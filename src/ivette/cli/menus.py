@@ -25,6 +25,7 @@ from ivette.cli.context import context, render_header
 from ivette.util import applog
 from ivette.util import hardware
 from ivette.util import resume
+from ivette.util.env import load_dotenv
 from ivette.util.paths import GAUSSIAN_BENCHMARK_RUN_DIR
 from ivette.module import gaussian16_core as g16
 from ivette.util.text import slugify
@@ -2441,14 +2442,17 @@ def _test_cluster_connection():
     from ivette.util.remote import RemoteTransport
 
     render_header()
-    ui.note("Set your username/host below, then I'll ssh in and try 'module load' + rung16. "
-            "Off-campus you must have the KUINS VPN up and an SSH key configured.")
-    hp = configure_stage("hpc")
+    ui.note("Credentials come from your .env (IVETTE_HPC_*); edit below to override for "
+            "this test. Off-campus you must have the KUINS VPN up, plus an SSH key (or set "
+            "IVETTE_HPC_PASSWORD in .env, which uses sshpass).")
+    hp = configure_stage("hpc", base=P.hpc_from_env())
     if not hp.user:
-        ui.error("No SSH username set — fill in 'user' (Supercomputer (PBS) → edit).")
+        ui.error("No SSH username — set IVETTE_HPC_USER in .env (copy .env.example) "
+                 "or fill 'user' here.")
         ui.pause()
         return
     transport = RemoteTransport(host=hp.host, user=hp.user, ssh_options=hp.ssh_options,
+                                password=os.environ.get("IVETTE_HPC_PASSWORD", ""),
                                 timeout=30)
     ui.info(f"Connecting to {hp.user}@{hp.host} …")
     with ui.status("ssh + module load test…"):
@@ -2549,6 +2553,7 @@ def resume_menu():
 
 def main():
     ensure_storage()
+    load_dotenv()          # pull IVETTE_HPC_* (and any other) settings from .env
     applog.configure()
     log = applog.get_logger("app")
     log.info("Ivette session started")

@@ -1,0 +1,18 @@
+%chk=water.chk
+%nprocshared=4
+%mem=8GB
+#p PBE0/6-311G opt scrf=(cpcm,solvent=water) MaxDisk=5GB
+
+water self-test (opt)
+
+0 1
+  O    0.000000  0.000000  0.117300
+  H    0.000000  0.757200 -0.469300
+  H    0.000000 -0.757200 -0.469300
+
+--Link1--
+%chk=water.chk
+%nprocshared=4
+%mem=8GB
+#p PBE0/6-311G freq geom=allcheck guess=read scrf=(cpcm,solvent=water) MaxDisk=5GB
+

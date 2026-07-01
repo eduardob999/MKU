@@ -43,7 +43,8 @@ def pick_queue(ncpus: int, mem_gb: int, walltime_h: int = 0, requested: str = "a
 def build_gaussian_input(coord_block: str, *, method: str, basis_set: str,
                          charge: int, multiplicity: int, nproc: int, mem: str,
                          cosmo: bool, operation: str, extra_keywords: str = "",
-                         chk: str = "mol.chk", title: str = "Ivette job") -> str:
+                         chk: str = "mol.chk", title: str = "Ivette job",
+                         max_disk: str = "") -> str:
     """Gaussian input (.gjf/.com). opt+freq becomes a two-section ``--Link1--`` job.
 
     The freq section uses ``geom=allcheck guess=read`` to continue from the
@@ -53,19 +54,20 @@ def build_gaussian_input(coord_block: str, *, method: str, basis_set: str,
     """
     scrf = " scrf=(cpcm,solvent=water)" if cosmo else ""
     extra = f" {extra_keywords.strip()}" if extra_keywords.strip() else ""
+    mdisk = f" MaxDisk={max_disk.strip()}" if max_disk.strip() else ""
     link0 = f"%chk={chk}\n%nprocshared={nproc}\n%mem={mem}\n"
     op = operation.lower()
 
     if "opt" in op and "freq" in op:
         return (
-            f"{link0}#p {method}/{basis_set} opt{scrf}{extra}\n\n"
+            f"{link0}#p {method}/{basis_set} opt{scrf}{mdisk}{extra}\n\n"
             f"{title} (opt)\n\n{charge} {multiplicity}\n{coord_block}\n\n"
             f"--Link1--\n{link0}"
-            f"#p {method}/{basis_set} freq geom=allcheck guess=read{scrf}{extra}\n\n"
+            f"#p {method}/{basis_set} freq geom=allcheck guess=read{scrf}{mdisk}{extra}\n\n"
         )
     route = operation.strip() or "sp"
     return (
-        f"{link0}#p {method}/{basis_set} {route}{scrf}{extra}\n\n"
+        f"{link0}#p {method}/{basis_set} {route}{scrf}{mdisk}{extra}\n\n"
         f"{title}\n\n{charge} {multiplicity}\n{coord_block}\n\n"
     )
 
@@ -76,8 +78,9 @@ def build_pbs_array_script(count: int, *, queue: str, ncpus: int, mem_gb: int,
                            walltime_hours: int = 0) -> str:
     """A csh PBS **job-array** script: sub-job *i* runs the *i*-th manifest line.
 
-    Each manifest line is ``<workdir> <input> <output>``; the sub-job cd's into
-    the per-compound directory and runs ``rung16``. Scratch is the per-job
+    Each manifest line is ``<workdir> <input> <output>`` where ``workdir`` is
+    **relative to the submit directory** (``$PBS_O_WORKDIR``); the sub-job cd's
+    into that per-compound directory and runs ``rung16``. Scratch is the per-job
     ``$TMPDIR`` (fast, auto-cleaned) per the cluster's guidance.
     """
     walltime = f"#PBS -l walltime={walltime_hours}:00:00\n" if walltime_hours else ""
@@ -97,7 +100,7 @@ def build_pbs_array_script(count: int, *, queue: str, ncpus: int, mem_gb: int,
         "set wd  = `echo \"$line\" | awk '{print $1}'`\n"
         "set inp = `echo \"$line\" | awk '{print $2}'`\n"
         "set out = `echo \"$line\" | awk '{print $3}'`\n"
-        'cd "$wd"\n'
+        'cd "$PBS_O_WORKDIR/$wd"\n'   # manifest workdir is relative to the submit dir
         'setenv GAUSS_SCRDIR "$TMPDIR"\n'
         'rung16 "$inp" "$out"\n'
     )
@@ -135,7 +138,7 @@ class SubmitResult:
 
 def submit_batch(transport, *, local_root, remote_root, manifest_lines,
                  script_text, manifest_name="manifest.txt", script_name="job.qsub",
-                 poll_seconds=30, sleep=None, progress=None) -> SubmitResult:
+                 poll_seconds=30, max_polls=None, sleep=None, progress=None) -> SubmitResult:
     """Stage inputs up, ``qsub`` the array, poll to completion, pull results back.
 
     ``transport`` provides ``run(cmd)->(rc,out,err)``, ``push(local,remote)`` and
@@ -148,6 +151,9 @@ def submit_batch(transport, *, local_root, remote_root, manifest_lines,
     from pathlib import Path
 
     sleep = sleep if sleep is not None else time.sleep
+    # A quoted "~" doesn't expand in a remote shell; treat "~/x" as home-relative "x".
+    if remote_root.startswith("~/"):
+        remote_root = remote_root[2:]
     lr = Path(local_root)
     (lr / manifest_name).write_text("\n".join(manifest_lines) + "\n")
     (lr / script_name).write_text(script_text)
@@ -166,9 +172,11 @@ def submit_batch(transport, *, local_root, remote_root, manifest_lines,
         _rc, qout, _qerr = transport.run(f'qstat -x "{job_id}"')
         if array_finished(qout, job_id):
             break
+        if max_polls and polls >= max_polls:
+            raise TimeoutError(f"job {job_id} still not finished after {polls} polls")
         if progress:
             progress(job_id, polls)
         sleep(poll_seconds)
 
-    transport.pull(remote_root, str(lr.parent))
+    transport.pull(remote_root, str(lr))   # mirror results back into local_root (in place)
     return SubmitResult(job_id=job_id, polls=polls)
