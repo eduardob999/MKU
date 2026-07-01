@@ -5,12 +5,15 @@ from ivette.core import params as P
 
 def test_stage_registry_maps_to_dataclasses():
     assert set(P.STAGES) == {
-        "structures", "download", "dataset", "gaussian", "training", "feature_selection",
+        "structures", "download", "dataset", "gaussian", "training",
+        "feature_selection", "hpc",
     }
     title, cls = P.STAGES["training"]
     assert title and cls is P.TrainingParams
     fs_title, fs_cls = P.STAGES["feature_selection"]
     assert fs_title and fs_cls is P.FeatureSelectionParams
+    hpc_title, hpc_cls = P.STAGES["hpc"]
+    assert hpc_title and hpc_cls is P.HpcParams
 
 
 def test_to_dict_and_round_trip():

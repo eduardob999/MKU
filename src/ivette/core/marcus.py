@@ -89,6 +89,7 @@ def _single_point(geom_log, work_dir, cid, *, charge, multiplicity, settings):
             nproc=settings["nproc"], mem=settings["mem"], cosmo=True,
             title=f"CID {cid} Marcus SP (q={charge}, m={multiplicity})",
             extra_keywords=settings.get("extra_keywords", ""),
+            max_disk=settings.get("max_disk", ""),
         )
     except Exception as exc:
         Path(xyz).unlink(missing_ok=True)
@@ -96,7 +97,8 @@ def _single_point(geom_log, work_dir, cid, *, charge, multiplicity, settings):
     Path(xyz).unlink(missing_ok=True)
 
     ok, err = g16.run_gaussian(gjf, log, g16_exec=settings.get("g16_exec", "g16"),
-                               timeout=settings.get("timeout"))
+                               timeout=settings.get("timeout"),
+                               scratch_dir=settings.get("scratch_dir"))
     if not ok or not g16.check_normal_termination(log):
         return None, log, err or "single point did not terminate normally"
     return g16.get_final_scf_energy(log), log, ""

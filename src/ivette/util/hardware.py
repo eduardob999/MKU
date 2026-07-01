@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -110,6 +111,45 @@ def _meminfo_mb(key: str) -> int | None:
     except (OSError, ValueError, IndexError):
         pass
     return None
+
+
+def physical_free_mb(path: str | None = None) -> int | None:
+    """Free space (MB) on the **physical** disk that actually backs Gaussian scratch.
+
+    Under WSL the Linux filesystem is a virtual disk (``ext4.vhdx``) that reports
+    huge free space regardless of the real Windows disk it grows into — so a naive
+    ``df /`` fools both us and Gaussian. The VHDX lives on the Windows C: drive,
+    reachable at ``/mnt/c``, so we read the free space there. On a native machine
+    we fall back to the given path (or home).
+    """
+    candidates = []
+    if Path("/mnt/c").exists():          # WSL: the VHDX grows on the Windows C: drive
+        candidates.append("/mnt/c")
+    candidates.append(path or str(Path.home()))
+    for c in candidates:
+        try:
+            return shutil.disk_usage(c).free // (1024 * 1024)
+        except OSError:
+            continue
+    return None
+
+
+def recommend_max_disk_gb(jobs: int = 1, *, free_mb: int | None = None,
+                          fraction: float = 0.5, floor_gb: int = 2) -> int:
+    """A safe per-job Gaussian ``MaxDisk`` (GB) from real free space.
+
+    Gaussian otherwise sizes its scratch to whatever the filesystem claims is free
+    — which on WSL is the VHDX's inflated figure — and will write scratch far
+    beyond the physical disk, crashing the machine. Capping ``MaxDisk`` to a
+    fraction of the *physical* free space, split across parallel jobs, keeps total
+    scratch within what actually exists.
+    """
+    if free_mb is None:
+        free_mb = physical_free_mb()
+    if not free_mb:
+        return floor_gb
+    per_job_gb = int((free_mb / 1024) * fraction / max(1, jobs))
+    return max(floor_gb, per_job_gb)
 
 
 def total_memory_mb() -> int | None:

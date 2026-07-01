@@ -464,6 +464,29 @@ def delete_geometry_set(geometry_id):
     return True
 
 
+def _disk_preflight(free_mb, jobs, *, min_gb=15):
+    """Guard against launching Gaussian when the real disk is nearly full.
+
+    ``free_mb`` is the *physical* free space (see ``hardware.physical_free_mb``).
+    Returns True to proceed. Aborts when space is dangerously low, since Gaussian
+    scratch (even capped) plus the growing WSL VHDX can still exhaust it.
+    """
+    if free_mb is None:
+        ui.warn("Could not determine physical free disk space — proceeding, but "
+                "watch the disk. On WSL this is the Windows C: free space.")
+        return True
+    free_gb = free_mb / 1024
+    ui.note(f"Physical free disk: {free_gb:.0f} GB → MaxDisk per job "
+            f"{hardware.recommend_max_disk_gb(jobs, free_mb=free_mb)} GB "
+            f"({jobs} parallel job(s)).")
+    if free_gb < min_gb:
+        ui.error(f"Only {free_gb:.0f} GB free on the physical disk — too low to run "
+                 "Gaussian safely (scratch could fill it and crash WSL). Free space "
+                 "first (empty ~/g16scratch, compact the WSL VHDX, or clear C:).")
+        return ui.confirm("Proceed anyway (risky)?", default=False)
+    return True
+
+
 def run_gaussian_pipeline(model_id, geometry_dir, operation, *, cosmo=False, charge_states=None):
     """Run the full Gaussian pipeline (hardware sizing + benchmarking + batch).
 
@@ -522,6 +545,16 @@ def run_gaussian_pipeline(model_id, geometry_dir, operation, *, cosmo=False, cha
     nproc = ui.ask_int("Cores per Gaussian job (%nprocshared)", plan.nproc)
     jobs = ui.ask_int("Parallel Gaussian jobs", plan.jobs)
     mem = ui.ask_text("Memory per job (%mem)", plan.mem)
+
+    # Scratch-disk safety: Gaussian sizes its .rwf scratch from the filesystem's
+    # reported free space, which under WSL is the VHDX's inflated figure — so it
+    # will happily write past the real (physical) disk and crash the machine. Cap
+    # MaxDisk to the real free space split across jobs, and abort if it's tiny.
+    free_mb = hardware.physical_free_mb()
+    if not _disk_preflight(free_mb, jobs):
+        return
+    max_disk = f"{hardware.recommend_max_disk_gb(jobs, free_mb=free_mb)}GB"
+    scratch_dir = str(Path(geometry_dir) / "gaussian" / "scratch")
 
     ui.rule(f"Gaussian: {operation}{' + COSMO' if cosmo else ''}")
     # Key the benchmark cache on TOTAL memory, not currently-available memory:
@@ -681,6 +714,7 @@ def run_gaussian_pipeline(model_id, geometry_dir, operation, *, cosmo=False, cha
             preopt_mode=preopt_mode, preopt_basis_set=preopt_basis_set,
             method=gp.method, basis_set=gp.basis_set,
             timeout=(gp.timeout or None), extra_keywords=gp.extra_keywords,
+            max_disk=max_disk, scratch_dir=scratch_dir,
         ),
         decide_existing=_decide_existing,
         on_state_start=_on_state_start,
@@ -1123,8 +1157,8 @@ def _compare_dft_value(model_id, row, geometry_dir, dft_id):
         ui.pause()
         return
 
-    add_dft_comparison(dft_id, res)        # persist to this set's history
-    _show_comparison_result(dft_id, res)   # renders the tables + ui.pause()
+    _, entry = add_dft_comparison(dft_id, res)  # persist; entry adds id + created
+    _show_comparison_result(dft_id, entry)      # renders the tables + ui.pause()
 
 
 def _benchmark_feature_selection(model_id, row, geometry_dir, dft_id=None):
@@ -1576,9 +1610,17 @@ def _run_marcus_reorganization(model_id, row, geometry_dir):
     nproc = ui.ask_int("Cores per single point (%nprocshared)", plan.nproc)
     mem = ui.ask_text("Memory per single point (%mem)", plan.mem)
 
+    # Cap scratch to the real physical free space (see _disk_preflight) so a runaway
+    # .rwf can't fill the disk and crash WSL — this is what caused the earlier crash.
+    free_mb = hardware.physical_free_mb()
+    if not _disk_preflight(free_mb, jobs):
+        return
+    max_disk = f"{hardware.recommend_max_disk_gb(jobs, free_mb=free_mb)}GB"
+    scratch_dir = str(cosmo_root.parent / "marcus" / "scratch")
+
     settings = dict(method=gp.method, basis_set=gp.basis_set, nproc=nproc, mem=mem,
                     extra_keywords=gp.extra_keywords, timeout=(gp.timeout or None),
-                    g16_exec="g16")
+                    g16_exec="g16", max_disk=max_disk, scratch_dir=scratch_dir)
 
     _ensure_control_room()
     ui.rule("Marcus reorganization energy (reusing COSMO geometries)")
@@ -2354,19 +2396,45 @@ def _stage_config_menu(stage_key):
         if names:
             ui.table([("Saved preset", "white")], [(n,) for n in names],
                      title=f"Presets — {title}")
-        action = ui.select(
-            f"{title} — configuration",
-            [
-                ("Manage presets / inspect values (opens editor)", "edit"),
-                ("← Back", "back"),
-            ],
-        )
+        actions = [("Manage presets / inspect values (opens editor)", "edit")]
+        if stage_key == "hpc":
+            actions.append(("Test supercomputer connection (SSH + module load)", "hpctest"))
+        actions.append(("← Back", "back"))
+        action = ui.select(f"{title} — configuration", actions)
         if action is ui.CANCEL or action == "back":
             return
         if action == "edit":
             # Reuse the stage editor for preset curation; the returned values are
             # transient here (defaults themselves live in code), so we discard them.
             configure_stage(stage_key)
+        elif action == "hpctest":
+            _test_cluster_connection()
+
+
+def _test_cluster_connection():
+    """Verify SSH reaches the cluster and Gaussian (rung16) is loadable."""
+    from ivette.util.remote import RemoteTransport
+
+    render_header()
+    ui.note("Set your username/host below, then I'll ssh in and try 'module load' + rung16. "
+            "Off-campus you must have the KUINS VPN up and an SSH key configured.")
+    hp = configure_stage("hpc")
+    if not hp.user:
+        ui.error("No SSH username set — fill in 'user' (Supercomputer (PBS) → edit).")
+        ui.pause()
+        return
+    transport = RemoteTransport(host=hp.host, user=hp.user, ssh_options=hp.ssh_options,
+                                timeout=30)
+    ui.info(f"Connecting to {hp.user}@{hp.host} …")
+    with ui.status("ssh + module load test…"):
+        ok, report = transport.test_connection(module=hp.gaussian_module)
+    if ok:
+        ui.success("✓ Cluster reachable, Gaussian module loads, rung16 found.")
+    else:
+        ui.error("Connection / setup check failed — see diagnostics below.")
+    ui.panel(report or "(no output)", title="Remote diagnostics",
+             border_style="success" if ok else "error")
+    ui.pause()
 
 
 def configuration_menu():

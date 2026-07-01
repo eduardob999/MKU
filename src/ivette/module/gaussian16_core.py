@@ -35,6 +35,7 @@ import argparse
 import dataclasses
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -184,6 +185,7 @@ def build_gjf(
     title:        str  = "Gaussian 16 DFT Calculation",
     extra_keywords: str = "",          # e.g. "empiricaldispersion=gd3bj"
     cosmo:        bool = False,        # SCRF=(CPCM,Solvent=Water)
+    max_disk:     str  = "",           # MaxDisk=... route cap, e.g. "8GB"
 ) -> str:
     """
     Generate a Gaussian 16 .gjf input string.
@@ -198,12 +200,15 @@ def build_gjf(
     """
     solvent_kw = " scrf=(cpcm,solvent=water)" if cosmo else ""
     extra = f" {extra_keywords.strip()}" if extra_keywords.strip() else ""
+    # Cap scratch so Gaussian can't size .rwf to the (VHDX-inflated) free space and
+    # overflow the physical disk. MaxDisk is a route keyword.
+    maxdisk_kw = f" MaxDisk={max_disk.strip()}" if max_disk.strip() else ""
 
     gjf = (
         f"%chk={chk_path}\n"
         f"%nprocshared={nproc}\n"
         f"%mem={mem}\n"
-        f"#p {method}/{basis_set} {operation}{solvent_kw}{extra}\n"
+        f"#p {method}/{basis_set} {operation}{solvent_kw}{maxdisk_kw}{extra}\n"
         f"\n"
         f"{title}\n"
         f"\n"
@@ -252,6 +257,7 @@ def run_gaussian(
     g16_exec: str = "g16",
     timeout:  Optional[int] = None,   # seconds; None = no limit
     cwd:      Optional[str] = None,
+    scratch_dir: Optional[str] = None,   # base for a per-run, auto-cleaned scratch
 ) -> tuple[bool, str]:
     """
     Run Gaussian 16 on *gjf_path*, writing output to *log_path*.
@@ -262,9 +268,23 @@ def run_gaussian(
     into its working directory. We default *cwd* to the directory holding the
     output log so those land beside the job's own files instead of polluting
     wherever the CLI was launched from (the repository root).
+
+    When ``scratch_dir`` is given, each run gets its OWN subdirectory there
+    (``GAUSS_SCRDIR`` points at it) which is deleted afterwards — success, failure,
+    or timeout. This stops multi-GB ``.rwf`` scratch from accumulating (a killed
+    or crashed job otherwise leaves it behind forever, which is what fills the disk).
     """
     cmd = [g16_exec, gjf_path, log_path]
     run_cwd = cwd or os.path.dirname(os.path.abspath(log_path)) or None
+
+    env = os.environ.copy()
+    job_scratch = None
+    if scratch_dir:
+        job_scratch = os.path.join(
+            scratch_dir, f"scr_{Path(gjf_path).stem}_{os.getpid()}")
+        os.makedirs(job_scratch, exist_ok=True)
+        env["GAUSS_SCRDIR"] = job_scratch
+
     try:
         result = subprocess.run(
             cmd,
@@ -272,6 +292,7 @@ def run_gaussian(
             text=True,
             timeout=timeout,
             cwd=run_cwd,
+            env=env,
         )
         if result.returncode != 0:
             return False, result.stderr.strip() or f"Exit code {result.returncode}"
@@ -282,6 +303,9 @@ def run_gaussian(
         return False, f"Gaussian timed out after {timeout}s"
     except Exception as exc:
         return False, str(exc)
+    finally:
+        if job_scratch and os.path.isdir(job_scratch):
+            shutil.rmtree(job_scratch, ignore_errors=True)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -659,10 +683,16 @@ def run_compound(
     cosmo:       bool  = False,
     timeout:     Optional[int] = None,
     extra_keywords: str = "",
+    max_disk:    str   = "",
+    scratch_dir: Optional[str] = None,
 ) -> RunResult:
     """
     Full pipeline for one compound:
       SDF → .gjf → g16 → parse .log → RunResult
+
+    ``max_disk`` caps Gaussian scratch (route ``MaxDisk=``) and ``scratch_dir``
+    isolates + auto-cleans per-run scratch — together they stop runaway ``.rwf``
+    files from overflowing the physical disk.
     """
     sdf_path = str(sdf_path)
     cid      = Path(sdf_path).stem
@@ -709,6 +739,7 @@ def run_compound(
                     mem=mem,
                     cosmo=cosmo,
                     title=f"CID {cid} (preopt)",
+                    max_disk=max_disk,
                 )
             except Exception as exc:
                 return RunResult(
@@ -717,7 +748,8 @@ def run_compound(
                     error_msg=f"Preopt GJF build failed: {exc}",
                 )
 
-            ok, err = run_gaussian(preopt_gjf, preopt_log, g16_exec=g16_exec, timeout=timeout)
+            ok, err = run_gaussian(preopt_gjf, preopt_log, g16_exec=g16_exec,
+                                   timeout=timeout, scratch_dir=scratch_dir)
             if not ok or not check_normal_termination(preopt_log):
                 return RunResult(
                     cid=cid, sdf_path=sdf_path, gjf_path=preopt_gjf,
@@ -763,7 +795,7 @@ def run_compound(
                 charge=charge, multiplicity=multiplicity,
                 nproc=nproc, mem=mem, cosmo=cosmo,
                 title=f"CID {cid} (opt)",
-                extra_keywords=extra_keywords,
+                extra_keywords=extra_keywords, max_disk=max_disk,
             )
         except Exception as exc:
             return RunResult(
@@ -772,7 +804,8 @@ def run_compound(
                 error_msg=f"GJF build failed: {exc}",
             )
 
-        ok, err = run_gaussian(opt_gjf_path, opt_log_path, g16_exec=g16_exec, timeout=timeout)
+        ok, err = run_gaussian(opt_gjf_path, opt_log_path, g16_exec=g16_exec,
+                               timeout=timeout, scratch_dir=scratch_dir)
         if not ok or not check_normal_termination(opt_log_path):
             return RunResult(
                 cid=cid, sdf_path=sdf_path, gjf_path=opt_gjf_path,
@@ -790,7 +823,7 @@ def run_compound(
                 charge=charge, multiplicity=multiplicity,
                 nproc=nproc, mem=mem, cosmo=cosmo,
                 title=f"CID {cid} (freq)",
-                extra_keywords=extra_keywords,
+                extra_keywords=extra_keywords, max_disk=max_disk,
             )
         except Exception as exc:
             Path(temp_xyz).unlink(missing_ok=True)
@@ -802,7 +835,8 @@ def run_compound(
         finally:
             Path(temp_xyz).unlink(missing_ok=True)
 
-        ok, err = run_gaussian(freq_gjf_path, freq_log_path, g16_exec=g16_exec, timeout=timeout)
+        ok, err = run_gaussian(freq_gjf_path, freq_log_path, g16_exec=g16_exec,
+                               timeout=timeout, scratch_dir=scratch_dir)
         if not ok or not check_normal_termination(freq_log_path):
             return RunResult(
                 cid=cid, sdf_path=sdf_path, gjf_path=freq_gjf_path,
@@ -827,7 +861,7 @@ def run_compound(
             charge=charge, multiplicity=multiplicity,
             nproc=nproc, mem=mem, cosmo=cosmo,
             title=f"CID {cid}",
-            extra_keywords=extra_keywords,
+            extra_keywords=extra_keywords, max_disk=max_disk,
         )
     except Exception as exc:
         return RunResult(
@@ -836,7 +870,8 @@ def run_compound(
         )
 
     # ── Run Gaussian ──────────────────────────────────────────────────────────
-    ok, err = run_gaussian(gjf_path, log_path, g16_exec=g16_exec, timeout=timeout)
+    ok, err = run_gaussian(gjf_path, log_path, g16_exec=g16_exec, timeout=timeout,
+                           scratch_dir=scratch_dir)
     if not ok or not check_normal_termination(log_path):
         return RunResult(
             cid=cid, sdf_path=sdf_path, gjf_path=gjf_path,

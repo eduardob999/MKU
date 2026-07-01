@@ -158,6 +158,35 @@ class FeatureSelectionParams:
         metadata={"help": "Drop one of any feature pair above this |correlation| (1 = off)"})
 
 
+@dataclass
+class HpcParams:
+    """Connection + scheduler settings for running Gaussian on the PBS cluster."""
+    host: str = field(
+        default="fe1.scl.kyoto-u.ac.jp",
+        metadata={"help": "PBS login-node hostname (reached over KUINS / VPN)"})
+    user: str = field(
+        default="", metadata={"help": "SSH username on the cluster (required)"})
+    remote_root: str = field(
+        default="~/ivette_runs",
+        metadata={"help": "Remote directory under which job inputs/outputs are staged"})
+    gaussian_module: str = field(
+        default="g16/c01",
+        metadata={"help": "Environment module to load for Gaussian (module load …)"})
+    queue: str = field(
+        default="auto",
+        metadata={"help": "PBS queue (auto = SMALL when it fits, else APC)",
+                  "choices": ["auto", "SMALL", "APC", "SDF"]})
+    walltime_hours: int = field(
+        default=0,
+        metadata={"help": "Requested walltime in hours (0 = queue default; SMALL caps at 12)"})
+    poll_seconds: int = field(
+        default=30,
+        metadata={"help": "How often to poll qstat for job completion"})
+    ssh_options: str = field(
+        default="-o BatchMode=yes",
+        metadata={"help": "Extra ssh options (key-based, non-interactive auth assumed)"})
+
+
 # ── Stage registry ───────────────────────────────────────────────────────────
 
 # key -> (human title, dataclass). The key is also the preset-store namespace.
@@ -168,6 +197,7 @@ STAGES: dict[str, tuple[str, type]] = {
     "gaussian": ("Gaussian / DFT", GaussianParams),
     "training": ("Model training", TrainingParams),
     "feature_selection": ("Feature selection", FeatureSelectionParams),
+    "hpc": ("Supercomputer (PBS)", HpcParams),
 }
 
 
