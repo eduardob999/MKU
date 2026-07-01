@@ -138,7 +138,8 @@ class SubmitResult:
 
 def submit_batch(transport, *, local_root, remote_root, manifest_lines,
                  script_text, manifest_name="manifest.txt", script_name="job.qsub",
-                 poll_seconds=30, max_polls=None, sleep=None, progress=None) -> SubmitResult:
+                 poll_seconds=60, max_polls=None, max_jobs=None,
+                 sleep=None, progress=None) -> SubmitResult:
     """Stage inputs up, ``qsub`` the array, poll to completion, pull results back.
 
     ``transport`` provides ``run(cmd)->(rc,out,err)``, ``push(local,remote)`` and
@@ -151,6 +152,10 @@ def submit_batch(transport, *, local_root, remote_root, manifest_lines,
     from pathlib import Path
 
     sleep = sleep if sleep is not None else time.sleep
+    if max_jobs and len(manifest_lines) > max_jobs:
+        raise ValueError(
+            f"refusing to submit {len(manifest_lines)} sub-jobs (> max_jobs={max_jobs}); "
+            "raise HpcParams.max_jobs_per_submit if this is intentional")
     # A quoted "~" doesn't expand in a remote shell; treat "~/x" as home-relative "x".
     if remote_root.startswith("~/"):
         remote_root = remote_root[2:]

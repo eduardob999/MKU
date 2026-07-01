@@ -51,3 +51,12 @@ def test_transport_password_auth_uses_sshpass_via_env():
     assert t._ssh_argv()[:3] == ["sshpass", "-e", "ssh"]
     assert t._ssh_e().startswith("sshpass -e ssh")
     assert t._env()["SSHPASS"] == "secret"                # password via env, not argv
+
+
+def test_transport_reuses_one_connection_via_multiplexing():
+    # ControlMaster/ControlPersist so many polls ride a single SSH session.
+    for t in (RemoteTransport(host="h", user="u"),
+              RemoteTransport(host="h", user="u", password="pw")):
+        opts = " ".join(t._opts())
+        assert "ControlMaster=auto" in opts and "ControlPersist=" in opts
+        assert "ControlMaster=auto" in t._ssh_e()

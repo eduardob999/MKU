@@ -21,6 +21,15 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 
+# Reuse ONE SSH connection across all run()/push()/pull() calls: the first opens a
+# master that persists briefly, and subsequent calls ride it instead of
+# re-authenticating. This turns hundreds of poll logins into a single session —
+# the key thing that keeps automated polling from looking like a brute-force
+# attempt to the cluster's intrusion detection.
+_MUX_OPTS = ["-o", "ControlMaster=auto",
+             "-o", "ControlPath=/tmp/ivette-ssh-%C",
+             "-o", "ControlPersist=120"]
+
 
 @dataclass
 class RemoteTransport:
@@ -44,9 +53,9 @@ class RemoteTransport:
     def _opts(self) -> list[str]:
         # With a password, BatchMode would block password auth; accept new host
         # keys so a first connect doesn't hang on the yes/no prompt.
-        if self.password:
-            return ["-o", "StrictHostKeyChecking=accept-new"]
-        return shlex.split(self.ssh_options)
+        base = (["-o", "StrictHostKeyChecking=accept-new"] if self.password
+                else shlex.split(self.ssh_options))
+        return base + _MUX_OPTS
 
     def _require_sshpass(self) -> None:
         if self.password and not shutil.which("sshpass"):

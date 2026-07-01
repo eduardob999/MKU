@@ -182,8 +182,13 @@ class HpcParams:
         default=0,
         metadata={"help": "Requested walltime in hours (0 = queue default; SMALL caps at 12)"})
     poll_seconds: int = field(
-        default=30,
-        metadata={"help": "How often to poll qstat for job completion"})
+        default=60,
+        metadata={"help": "How often to poll qstat for job completion (gentle on the "
+                          "scheduler; connections are reused so this can be relaxed)"})
+    max_jobs_per_submit: int = field(
+        default=500,
+        metadata={"help": "Safety cap on array size — refuse to submit more sub-jobs "
+                          "than this in one go, so a bug can't flood the queue"})
     ssh_options: str = field(
         default="-o BatchMode=yes -o StrictHostKeyChecking=accept-new",
         metadata={"help": "Extra ssh options (key-based, non-interactive auth assumed)"})

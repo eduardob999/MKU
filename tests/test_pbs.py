@@ -97,6 +97,19 @@ def test_submit_batch_stages_polls_and_pulls(tmp_path):
     assert ("pull", "ivette_runs/geom", str(local_root)) in ft.calls
 
 
+def test_submit_batch_refuses_oversized_array(tmp_path):
+    import pytest
+    local = tmp_path / "g"
+    local.mkdir()
+    ft = _FakeTransport(["done"])
+    with pytest.raises(ValueError, match="max_jobs"):
+        pbs.submit_batch(ft, local_root=str(local), remote_root="ivette_runs",
+                         manifest_lines=["a", "b", "c"], script_text="x",
+                         max_jobs=2, sleep=lambda s: None)
+    # nothing was submitted
+    assert not any("qsub" in c[-1] for c in ft.calls if c[0] == "run")
+
+
 def test_submit_batch_strips_leading_tilde(tmp_path):
     # "~/x" must become home-relative "x" — a quoted "~" won't expand remotely.
     local = tmp_path / "g"
