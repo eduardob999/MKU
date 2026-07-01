@@ -24,6 +24,7 @@ from ivette.cli import ui
 from ivette.cli.context import context, render_header
 from ivette.util import applog
 from ivette.util import hardware
+from ivette.util import resume
 from ivette.util.paths import GAUSSIAN_BENCHMARK_RUN_DIR
 from ivette.module import gaussian16_core as g16
 from ivette.util.text import slugify
@@ -555,6 +556,18 @@ def run_gaussian_pipeline(model_id, geometry_dir, operation, *, cosmo=False, cha
         return
     max_disk = f"{hardware.recommend_max_disk_gb(jobs, free_mb=free_mb)}GB"
     scratch_dir = str(Path(geometry_dir) / "gaussian" / "scratch")
+    shutil.rmtree(scratch_dir, ignore_errors=True)   # clear any orphaned scratch from a crash
+
+    # Journal this run so the main menu's Resume can re-enter it if it's
+    # interrupted or the machine crashes; cleared only after it completes.
+    geometry_id = _geometry_id_for(geometry_dir)
+    resume_key = f"gaussian:{geometry_id}:{operation}:{int(cosmo)}"
+    resume.record_run(resume_key, {
+        "kind": "gaussian", "model_id": model_id, "geometry_dir": str(geometry_dir),
+        "operation": operation, "cosmo": cosmo, "charge_states": charge_states,
+        "target": (GEOMETRIES.get(geometry_id) or {}).get("target"),
+        "label": f"{operation}{' + COSMO (neutral+anion)' if cosmo else ''}",
+    })
 
     ui.rule(f"Gaussian: {operation}{' + COSMO' if cosmo else ''}")
     # Key the benchmark cache on TOTAL memory, not currently-available memory:
@@ -729,7 +742,6 @@ def run_gaussian_pipeline(model_id, geometry_dir, operation, *, cosmo=False, cha
         kind, set_name = "cosmo", f"{operation} + COSMO (neutral + anion)"
     else:
         kind, set_name = "opt_freq", operation
-    geometry_id = _geometry_id_for(geometry_dir)
     ginfo = GEOMETRIES.get(geometry_id) or {}
     register_or_update_calculation_set(
         model_id=model_id, target=ginfo.get("target"), geometry_id=geometry_id,
@@ -737,6 +749,8 @@ def run_gaussian_pipeline(model_id, geometry_dir, operation, *, cosmo=False, cha
         charge_states=charge_states, output_dir=str(gaussian_root),
         parameters={"method": gp.method, "basis_set": gp.basis_set},
     )
+    # Completed cleanly → drop the resume journal entry.
+    resume.clear_run(resume_key)
     ui.pause()
 
 
@@ -1617,10 +1631,20 @@ def _run_marcus_reorganization(model_id, row, geometry_dir):
         return
     max_disk = f"{hardware.recommend_max_disk_gb(jobs, free_mb=free_mb)}GB"
     scratch_dir = str(cosmo_root.parent / "marcus" / "scratch")
+    shutil.rmtree(scratch_dir, ignore_errors=True)   # clear any orphaned scratch from a crash
 
     settings = dict(method=gp.method, basis_set=gp.basis_set, nproc=nproc, mem=mem,
                     extra_keywords=gp.extra_keywords, timeout=(gp.timeout or None),
                     g16_exec="g16", max_disk=max_disk, scratch_dir=scratch_dir)
+
+    # Journal for the Resume menu; the SP outputs resume in place (already-run
+    # single points are skipped), so re-entering after a crash just finishes them.
+    geometry_id = _geometry_id_for(geometry_dir)
+    resume_key = f"marcus:{geometry_id}"
+    resume.record_run(resume_key, {
+        "kind": "marcus", "model_id": model_id, "geometry_dir": str(geometry_dir),
+        "target": row["target"], "label": "Marcus reorganization energy (single points)",
+    })
 
     _ensure_control_room()
     ui.rule("Marcus reorganization energy (reusing COSMO geometries)")
@@ -1633,6 +1657,7 @@ def _run_marcus_reorganization(model_id, row, geometry_dir):
 
         rows, _skipped = compute_marcus(cosmo_root, settings=settings, jobs=jobs,
                                         progress=_progress)
+    resume.clear_run(resume_key)   # SPs all attempted → no longer "in flight"
 
     ok = [r for r in rows if r.get("reorg_energy_eV") is not None]
     failed = [r for r in rows if r.get("reorg_energy_eV") is None]
@@ -2470,6 +2495,58 @@ def configuration_menu():
             _stage_config_menu(action)
 
 
+def _resume_run(key, rec):
+    """Re-enter an interrupted run; it resumes via its own checkpoint (done work skipped)."""
+    gd = Path(rec["geometry_dir"])
+    if not gd.exists():
+        ui.warn("The geometry set for this run no longer exists — discarding it.")
+        resume.clear_run(key)
+        ui.pause()
+        return
+    kind = rec.get("kind")
+    if kind == "gaussian":
+        cs = rec.get("charge_states")
+        cs = [tuple(s) for s in cs] if cs else None
+        run_gaussian_pipeline(rec["model_id"], gd, rec["operation"],
+                              cosmo=rec.get("cosmo", False), charge_states=cs)
+    elif kind == "marcus":
+        _run_marcus_reorganization(rec["model_id"], {"target": rec.get("target")}, gd)
+    else:
+        ui.warn(f"Unknown run type '{kind}'.")
+        ui.pause()
+
+
+def resume_menu():
+    """List interrupted runs (crashed or stopped) and re-enter or discard them."""
+    while True:
+        active = resume.active_runs()
+        render_header()
+        if not active:
+            ui.note("No interrupted runs to resume — everything finished cleanly.")
+            ui.pause()
+            return
+        ui.note("These runs were left in-flight (interrupted or crashed). Resuming picks "
+                "up where it left off — already-finished compounds are skipped.")
+        choices = [ui.section("Interrupted runs")]
+        for key, rec in active:
+            started = rec.get("started", "").replace("T", " ")
+            tgt = f"  ·  {rec['target']}" if rec.get("target") else ""
+            choices.append((f"↻ {rec.get('label', rec.get('kind'))}{tgt}  ·  started {started}",
+                            ("resume", key, rec)))
+            choices.append(("      ✕ Discard this entry", ("discard", key, rec)))
+        choices += [ui.section(""), ("← Back", ("back", None, None))]
+        choice = ui.select("Resume", choices)
+        act, key, rec = (("back", None, None) if choice is ui.CANCEL else choice)
+        if act == "back":
+            return
+        if act == "discard":
+            resume.clear_run(key)
+            ui.success("Discarded.")
+            ui.pause()
+        elif act == "resume":
+            _resume_run(key, rec)
+
+
 def main():
     ensure_storage()
     applog.configure()
@@ -2493,6 +2570,14 @@ def _run_main_loop(log):
 
             sets = list(STRUCTURES.items())
             choices = []
+            # Resume comes first: one click back into a long run that was
+            # interrupted or crashed (entries persist until a run finishes cleanly).
+            active = resume.active_runs()
+            if active:
+                choices.append(ui.section("Resume"))
+                plural = "s" if len(active) > 1 else ""
+                choices.append(
+                    (f"↻ Resume interrupted run{plural} ({len(active)})", ("resume", None)))
             if sets:
                 choices.append(ui.section("Structure libraries"))
                 choices += [
@@ -2510,11 +2595,26 @@ def _run_main_loop(log):
             if action == "exit":
                 log.info("Ivette session ended")
                 break
-            if action == "open":
-                structure_library_menu(structure_id)
-            elif action == "new":
-                generate_structure_library_menu()
-            elif action == "reports":
-                reports_menu()
-            elif action == "config":
-                configuration_menu()
+            # Ctrl-C cancels the current action and drops back to this menu instead
+            # of crashing the app. A long run interrupted this way keeps its resume
+            # entry (it's cleared only on clean completion), so it can be continued
+            # from ↻ Resume. Use ✕ Exit to actually quit.
+            try:
+                if action == "open":
+                    structure_library_menu(structure_id)
+                elif action == "new":
+                    generate_structure_library_menu()
+                elif action == "resume":
+                    resume_menu()
+                elif action == "reports":
+                    reports_menu()
+                elif action == "config":
+                    configuration_menu()
+            except KeyboardInterrupt:
+                log.info("action interrupted by user | action=%s", action)
+                try:
+                    ui.warn("Interrupted — returned to the main menu. "
+                            "Pick ↻ Resume to continue an interrupted run.")
+                    ui.pause()
+                except KeyboardInterrupt:
+                    pass   # a second Ctrl-C just drops straight back to the menu

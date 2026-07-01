@@ -228,8 +228,14 @@ def compute_marcus(cosmo_root, *, settings, oxidized=("neutral", 0, 1),
     if jobs and jobs > 1 and tasks:
         with ProcessPoolExecutor(max_workers=jobs) as pool:
             futures = [pool.submit(_run_sp_pair, t) for t in tasks]
-            for fut in as_completed(futures):
-                _finish(*fut.result())
+            try:
+                for fut in as_completed(futures):
+                    _finish(*fut.result())
+            except KeyboardInterrupt:
+                # Don't block on running single points — cancel and propagate so the
+                # menu returns cleanly; the resume entry (set by the caller) survives.
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
     else:
         for t in tasks:
             _finish(*_run_sp_pair(t))

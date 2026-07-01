@@ -56,6 +56,7 @@ DFT_DESCRIPTOR_METADATA_FILE = DFT_DESCRIPTOR_DIR / "metadata.json"
 LOG_DIR = DATA_DIR / "logs"          # application log + standalone-run timing logs
 EXPORT_DIR = DATA_DIR / "exports"    # default sink for standalone CLI outputs
 PRESET_DIR = DATA_DIR / "presets"    # named per-stage parameter presets (JSON)
+RESUME_FILE = DATA_DIR / "resume.json"   # in-flight long-running runs (for the Resume menu)
 
 
 def export_path(name: str) -> str:
