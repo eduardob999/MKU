@@ -66,7 +66,8 @@ class DatasetParams:
 @dataclass
 class GaussianParams:
     method: str = field(
-        default="PBE0", metadata={"help": "DFT functional (e.g. B3LYP, PBE0, M062X)"})
+        default="PBE1PBE", metadata={"help": "DFT functional (e.g. B3LYP, PBE1PBE, M062X). "
+                                             "NB: PBE0 must be spelled PBE1PBE — G16 reads 'PBE0' as the PBE0DH double hybrid"})
     basis_set: str = field(
         default="6-311G", metadata={"help": "Basis set (e.g. 6-311G, 6-311G(d,p), 6-311+G(d,p))"})
     preopt_mode: str = field(

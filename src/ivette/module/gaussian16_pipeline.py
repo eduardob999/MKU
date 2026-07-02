@@ -1016,7 +1016,7 @@ def run_pipeline(
     skip_preopt:      bool          = False,
     # Gaussian DFT settings
     basis_set:        str           = "6-311G*",
-    method:           str           = "PBE0",
+    method:           str           = "PBE1PBE",
     operation:        str           = "opt freq",
     nproc:            int           = 10,
     mem:              str           = "28GB",
@@ -1538,8 +1538,9 @@ def main(argv=None) -> int:
     )
 
     # ── Gaussian DFT settings ─────────────────────────────────────────────────
-    parser.add_argument("--method",    default="PBE0",
-                        help="DFT functional (default: PBE0)")
+    parser.add_argument("--method",    default="PBE1PBE",
+                        help="DFT functional (default: PBE1PBE, i.e. PBE0 — "
+                             "the literal keyword 'PBE0' selects the PBE0DH double hybrid in G16)")
     parser.add_argument("--basis",     default="6-311G*",
                         help="Basis set (default: 6-311G*)")
     parser.add_argument("--operation", default="opt then freq",

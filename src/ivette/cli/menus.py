@@ -188,7 +188,7 @@ def _run_preopt_benchmark(benchmark_dir: Path, benchmark_sdf: Path, mem: str, np
                 work_dir=str(preopt_work),
                 g16_exec="g16",
                 basis_set="6-31G*",
-                method="PBE0",
+                method="PBE1PBE",
                 operation="opt",
                 nproc=nproc,
                 mem=mem,
